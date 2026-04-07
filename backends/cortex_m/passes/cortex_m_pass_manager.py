@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-
 import inspect
 from typing import Any, Optional, Type
 
@@ -13,6 +12,7 @@ from executorch.backends.arm._passes import (
     ScalarsToAttributePass,
 )
 from executorch.backends.cortex_m.target_config import CortexM, CortexMTargetConfig
+from executorch.backends.transforms.addmm_mm_to_linear import AddmmToLinearTransform
 from executorch.backends.transforms.convert_conv1d_to_conv2d_pass import (
     ConvertConv1dToConv2dPass,
 )
@@ -33,7 +33,12 @@ from torch.export import ExportedProgram
 
 from .activation_fusion_pass import ActivationFusionPass
 from .aten_to_cortex_m_pass import AtenToCortexMPass
+from .bypass_flatten_for_linear_pass import BypassFlattenForLinearPass
 from .clamp_hardswish_pass import ClampHardswishPass
+from .collapse_float_activation_decomposition_pass import (
+    CollapseFloatActivationDecompositionPass,
+)
+from .convert_to_cortex_m_pass import ConvertToCortexMPass
 from .decompose_hardswish_pass import DecomposeHardswishPass
 from .decompose_mean_pass import DecomposeMeanPass
 from .explicit_layout_pass import (
@@ -41,8 +46,23 @@ from .explicit_layout_pass import (
     CortexMReplaceOpsWithChannelsLastVariants,
     ValidateCortexMExplicitLayoutPass,
 )
+from .float_activation_rewrite_pass import FloatActivationRewritePass
+from .float_capabilities import (
+    CortexMFloatCapabilities,
+    get_cortex_m_float_capabilities,
+)
+from .float_op_rewrite_pass import FloatOpRewritePass
+from .float_pool_rewrite_pass import FloatPoolRewritePass
+from .fold_batch_norm_into_conv_pass import FoldBatchNormIntoConvPass
+from .fold_batch_norm_into_linear_pass import FoldBatchNormIntoLinearPass
 from .matmul_to_bmm_pass import MatmulToBmmPass
+from .normalize_dim_order_pass import NormalizeDimOrderPass
+from .pack_float_conv_weights_pass import PackFloatConvWeightsPass
 from .quantized_clamp_activation_pass import QuantizedClampActivationPass
+from .remove_redundant_clone_dim_order_pass import RemoveRedundantCloneDimOrderPass
+from .remove_unused_constant_placeholders_pass import (
+    RemoveUnusedConstantPlaceholdersPass,
+)
 from .replace_quant_nodes_pass import ReplaceQuantNodesPass
 
 PassClass = Type[ExportPass]
@@ -50,7 +70,7 @@ PassClass = Type[ExportPass]
 
 class CortexMPassManager(PassManager):
     legacy_pass_list: list[PassClass] = [
-        # Run before folding so qparams attach to max_pool2d values, not tuple + getitem.
+        # Preserve the current upstream quantized lowering sequence.
         RemoveGetItemPass,
         FoldAndAnnotateQParamsPass,
         ReplaceScalarWithTensorArgPass,
@@ -59,6 +79,33 @@ class CortexMPassManager(PassManager):
         QuantizedClampActivationPass,
         DecomposeHardswishPass,
         AtenToCortexMPass,
+        # Float canonicalization starts after quantized aten nodes are lowered.
+        AddmmToLinearTransform,
+        DecomposeMeanPass,
+        NormalizeDimOrderPass,
+        CollapseFloatActivationDecompositionPass,
+        # Rewrite simple float ops and tag activations that can be fused.
+        FloatOpRewritePass,
+        # Fold dense BN while linear weights still have their ordinary rank-2
+        # [out, in] shape, before ConvertToCortexMPass packs them.
+        FoldBatchNormIntoLinearPass,
+        NormalizeDimOrderPass,
+        BypassFlattenForLinearPass,
+        FloatPoolRewritePass,
+        FloatActivationRewritePass,
+        CollapseFloatActivationDecompositionPass,
+        # Conv, transpose-conv, BMM and linear packing require graph surgery.
+        ConvertToCortexMPass,
+        # Folding may expose a conv that earlier metadata/layout checks could
+        # not lower, so normalize and run the idempotent conversion once more.
+        FoldBatchNormIntoConvPass,
+        NormalizeDimOrderPass,
+        ConvertToCortexMPass,
+        # Packing must follow BN folding, which requires unpacked OHWI weights.
+        PackFloatConvWeightsPass,
+        RemoveUnusedConstantPlaceholdersPass,
+        BypassFlattenForLinearPass,
+        RemoveRedundantCloneDimOrderPass,
     ]
 
     explicit_layout_pass_list: list[PassClass] = [
@@ -96,42 +143,29 @@ class CortexMPassManager(PassManager):
         passes: Optional[list[PassClass]] = None,
         target_config: Optional[CortexMTargetConfig] = None,
         use_explicit_layout: bool = False,
+        capabilities: Optional[CortexMFloatCapabilities] = None,
     ) -> None:
         """Initialize the Cortex-M pass manager.
 
-        Args:
-            exported_program: The exported program to transform. Required
-                before calling ``transform()``; may be ``None`` for callers
-                that only use ``transform_for_annotation()``.
-            passes: Optional override of the pass list. Defaults to
-                the legacy or explicit-layout pass list selected by
-                ``use_explicit_layout``.
-            target_config: Compilation target for passes that need it.
-                Defaults to ``CortexMTargetConfig(cpu=CortexM.M55)``, which
-                resolves through cmsis_nn to the MVE backend — matching the
-                pre-config historical behaviour.
-            use_explicit_layout: Select the experimental explicit-layout pass
-                sequence. Legacy lowering remains the default.
+        The explicit-layout sequence remains the upstream quantized pipeline.
+        Float lowering currently uses the legacy dim-order representation.
         """
         super().__init__(passes=[])
         self.exported_program = exported_program
-        # PassManager.passes is typed as callables; this manager stores pass classes which are initialized at transform time with the exported_program.
         default_passes = (
             self.explicit_layout_pass_list
             if use_explicit_layout
             else self.legacy_pass_list
         )
         self.passes: list[PassClass] = (  # type: ignore[assignment]
-            passes if passes is not None else default_passes  # type: ignore[assignment]
+            passes if passes is not None else default_passes
         )
-        self.target_config: CortexMTargetConfig = target_config or CortexMTargetConfig(
-            cpu=CortexM.M55
-        )
+        self.target_config = target_config or CortexMTargetConfig(cpu=CortexM.M55)
+        self.capabilities = capabilities or get_cortex_m_float_capabilities()
 
     def transform_for_annotation(self, model):
-        passes = self.pass_list_transform_for_annotation
-        for p in passes:
-            model = p().call(model).graph_module
+        for pass_cls in self.pass_list_transform_for_annotation:
+            model = pass_cls().call(model).graph_module
         return model
 
     def transform(self) -> ExportedProgram:
@@ -155,11 +189,10 @@ class CortexMPassManager(PassManager):
                 kwargs["exported_program"] = exported_program
             if "target_config" in signature.parameters:
                 kwargs["target_config"] = self.target_config
+            if "capabilities" in signature.parameters:
+                kwargs["capabilities"] = self.capabilities
 
-            transform_pass = pass_cls(**kwargs)
-            exported_program = _transform(exported_program, transform_pass)
+            exported_program = _transform(exported_program, pass_cls(**kwargs))
 
-        # All constant tensors should be lifted to buffers at this point, re-run
-        # lift_constant_tensor_pass in case new ones have been introduced.
-        exported_program = lift_constant_tensor_pass(exported_program)
-        return exported_program
+        # Float packing and folding can create new constants.
+        return lift_constant_tensor_pass(exported_program)

@@ -190,11 +190,21 @@
 #endif // ifndef
 
 // Define size_t and ssize_t.
-#ifndef _MSC_VER
+//
+// Bare-metal toolchains such as Arm Compiler 6 do not necessarily provide
+// POSIX headers like <sys/types.h>. Fall back to <stddef.h> and define
+// ssize_t ourselves when that header is unavailable.
+#include <stddef.h>
+#if defined(_MSC_VER)
+using ssize_t = ptrdiff_t;
+#elif defined(__has_include)
+#if __has_include(<sys/types.h>)
 #include <sys/types.h>
 #else
-#include <stddef.h>
 using ssize_t = ptrdiff_t;
+#endif
+#else
+#include <sys/types.h>
 #endif
 
 #ifdef __EXCEPTIONS

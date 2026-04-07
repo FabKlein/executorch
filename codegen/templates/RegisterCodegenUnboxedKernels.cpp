@@ -40,9 +40,21 @@ static KernelSpan kernel_span(
     kernels_to_register,
     kernels_to_register + sizeof(kernels_to_register) / sizeof(Kernel));
 
-// Return value not used. Keep the static variable assignment to register
-// kernels in static initialization time.
+#if defined(ET_REGISTER_KERNELS_FN)
+// Some bare-metal runners prefer to call registration explicitly at startup
+// instead of relying on static initialization. The build sets
+// ET_REGISTER_KERNELS_FN to give this generated library a stable entry point.
+extern "C" ::executorch::runtime::Error ET_REGISTER_KERNELS_FN(void) {
+  return register_kernels(kernel_span);
+}
+#else
+// Default hosted path: register kernels during static initialization when this
+// translation unit is loaded into the process.
+//
+// Return value not used. Keep the static variable assignment to preserve the
+// side effect of registering kernels before main().
 static auto success_with_kernel_reg = register_kernels(kernel_span);
+#endif
 } // namespace
 } // namespace function
 } // namespace executor

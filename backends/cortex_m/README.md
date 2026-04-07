@@ -19,6 +19,13 @@ After the legacy AOT compatibility period, the legacy support table, pass list, 
 
 For a detailed example of the full lowering flow, see `examples/arm/cortex_m_mv2_example.ipynb`.
 
+> [!NOTE]
+> In addition to the quantized flow, the backend also has early `float32` and
+> `float16` lowering support for selected CMSIS-NN float operators (under development). This path is
+> still more experimental than the quantized flow: operator coverage is
+> narrower, lowering is more sensitive to graph/export details, and support
+> should be treated as bring-up/developer-oriented rather than production-ready.
+
 ## Testing
 Tests are available in `backends/cortex_m/test/` using the `backends/test` harness. The python implementations of the operators are tested in tests named `test_dialect_*`, while actual accelerated implementations are tested on simulated hardware in the tests named `test_implementation_*`.
 

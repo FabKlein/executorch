@@ -309,15 +309,18 @@ test_cases = {
             ramp_tensor(0, 10, (1, 2, 1, 1)).to(memory_format=torch.channels_last),
         ),
     ),
-    # Single-channel depthwise convolution tests (in_channels == groups == 1)
+    # Quantized lowering keeps groups == 1 as a regular convolution, even when
+    # in_channels == 1.  The float backend intentionally differs: it may route
+    # this single-input-channel case through depthwise_conv2d because it is
+    # equivalent to depthwise with depth_multiplier == out_channels.
     "depthwise_conv2d_single_channel": McuTestCase(
-        model=CortexMDepthwiseConv2D(1, 1, 3, groups=1),
+        model=CortexMConv2D(1, 1, 3, groups=1),
         example_inputs=(
             ramp_tensor(0, 10, (1, 1, 8, 8)).to(memory_format=torch.channels_last),
         ),
     ),
     "depthwise_conv2d_single_channel_multiplier": McuTestCase(
-        model=CortexMDepthwiseConv2D(1, 3, 3, groups=1),
+        model=CortexMConv2D(1, 3, 3, groups=1),
         example_inputs=(
             ramp_tensor(0, 10, (1, 1, 8, 8)).to(memory_format=torch.channels_last),
         ),
@@ -347,6 +350,7 @@ def test_dialect_conv2d(test_case, cortex_m_target):
 xfails_implementation: dict[str, xfail_type] = {
     "conv1d": "Currently not supported.",
     "conv3d": "Currently not supported.",
+    "conv2d_nchw": "Currently not supported.",
 }
 
 

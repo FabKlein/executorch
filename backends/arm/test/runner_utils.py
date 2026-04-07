@@ -39,6 +39,7 @@ from executorch.backends.arm.vgf.model_converter import (
 )
 from executorch.exir import ExecutorchProgramManager, ExportedProgram
 from executorch.exir.lowered_backend_module import LoweredBackendModule
+from torch.export.graph_signature import InputKind
 from torch.fx.node import Node
 from torch.overrides import TorchFunctionMode
 from tosa.TosaGraph import TosaGraph  # type: ignore[import-not-found, import-untyped]
@@ -146,7 +147,13 @@ def get_input_names(
     """
 
     if not is_lowered_module:
-        return [spec.arg.name for spec in program.graph_signature.input_specs]
+        # Parameters and buffers may also appear as graph placeholders, but
+        # only user inputs are backed by semihosted input files.
+        return [
+            spec.arg.name
+            for spec in program.graph_signature.input_specs
+            if spec.kind == InputKind.USER_INPUT
+        ]
     else:
         return [
             user_input
@@ -1059,14 +1066,27 @@ def _elf_path_candidates(
         candidates.extend(
             [
                 root_build_dir / binary_name,
+                root_build_dir / f"{binary_name}.elf",
                 root_build_dir / "Release" / binary_name,
+                root_build_dir / "Release" / f"{binary_name}.elf",
                 root_build_dir / "examples" / "arm" / "executor_runner" / binary_name,
+                root_build_dir
+                / "examples"
+                / "arm"
+                / "executor_runner"
+                / f"{binary_name}.elf",
                 root_build_dir
                 / "examples"
                 / "arm"
                 / "executor_runner"
                 / "Release"
                 / binary_name,
+                root_build_dir
+                / "examples"
+                / "arm"
+                / "executor_runner"
+                / "Release"
+                / f"{binary_name}.elf",
             ]
         )
 

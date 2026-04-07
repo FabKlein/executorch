@@ -48,7 +48,14 @@ std::tuple<Tensor&, Tensor&> native_dropout_out(
   ET_DEFINE_OPERATOR_NAME(op_name, "native_dropout.out");
   if ((!train.has_value() || train.value()) && prob != 0) {
     {
-      std::mt19937 gen((std::random_device())());
+      // Some bare-metal libc++ configurations expose <random> but explicitly
+      // disable std::random_device. Fall back to the deterministic mt19937
+      // default seed when that capability is unavailable.
+      uint32_t seed = 5489u;
+#if !defined(_LIBCPP_HAS_RANDOM_DEVICE) || _LIBCPP_HAS_RANDOM_DEVICE
+      seed = (std::random_device())();
+#endif
+      std::mt19937 gen(seed);
       std::uniform_real_distribution<double> dist;
       bool* const mask_data_ptr = mask.mutable_data_ptr<bool>();
       for (const auto ii : c10::irange(mask.numel())) {

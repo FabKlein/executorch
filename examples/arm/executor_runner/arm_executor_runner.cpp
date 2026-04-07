@@ -111,7 +111,10 @@
 #include <executorch/runtime/platform/platform.h>
 #include <executorch/runtime/platform/runtime.h>
 #include <stdio.h>
+#include <cstdlib>
+#if !defined(__ARMCOMPILER_VERSION)
 #include <unistd.h>
+#endif
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -146,6 +149,17 @@ using printf_size_t = unsigned long;
 #endif
 
 #endif // defined(ET_EVENT_TRACER_ENABLED)
+
+ET_NORETURN void runner_exit(int code);
+
+#if defined(EXECUTORCH_ARM_EXPLICIT_KERNEL_REGISTRATION)
+// ArmClang and plain Clang builds explicitly register selected kernel
+// libraries instead of relying on static constructors from archives.
+extern "C" executorch::runtime::Error executorch_arm_register_cortex_m_ops();
+#if defined(EXECUTORCH_ARM_HAS_PORTABLE_OP_REGISTRATION)
+extern "C" executorch::runtime::Error executorch_arm_register_portable_ops();
+#endif
+#endif
 
 #if defined(SEMIHOSTING)
 
@@ -329,7 +343,15 @@ constexpr size_t FAST_MEMORY_REGION_INDEX = 2;
 #if !defined(SEMIHOSTING)
   __builtin_trap();
 #else
-  _exit(-1);
+  runner_exit(-1);
+#endif
+}
+
+ET_NORETURN void runner_exit(int code) {
+#if defined(__ARMCOMPILER_VERSION)
+  std::exit(code);
+#else
+  _exit(code);
 #endif
 }
 
@@ -1088,6 +1110,13 @@ void print_outputs(RunnerContext& ctx) {
               i,
               j,
               tensor.const_data_ptr<float>()[j]);
+        } else if (tensor.scalar_type() == ScalarType::Half) {
+          printf(
+              "Output[%d][%d]: (half) %f\n",
+              i,
+              j,
+              static_cast<float>(
+                  tensor.const_data_ptr<executorch::aten::Half>()[j]));
         } else if (tensor.scalar_type() == ScalarType::Char) {
           printf(
               "Output[%d][%d]: (char) %d\n",
@@ -1415,7 +1444,7 @@ int main(int argc, const char* argv[]) {
     ET_LOG(Fatal, "Not right number of parameters!");
     ET_LOG(Fatal, "app -o output_basename -i input.bin [-i input2.bin]");
     ET_LOG(Fatal, "Exiting!");
-    _exit(1);
+    runner_exit(1);
   }
 #else
   if (argc < 7) {
@@ -1424,7 +1453,7 @@ int main(int argc, const char* argv[]) {
         Fatal,
         "app -m model.pte -i input.bin [-i input2.bin] -o output_basename");
     ET_LOG(Fatal, "Exiting!");
-    _exit(1);
+    runner_exit(1);
   }
 #endif
   ET_LOG(Info, "   %s", argv[0]);
@@ -1437,6 +1466,22 @@ int main(int argc, const char* argv[]) {
 #endif
 
   executorch::runtime::runtime_init();
+#if defined(EXECUTORCH_ARM_EXPLICIT_KERNEL_REGISTRATION)
+  {
+    Error status = executorch_arm_register_cortex_m_ops();
+    ET_CHECK_MSG(
+        status == Error::Ok,
+        "Failed to register Cortex-M kernels: 0x%" PRIx32,
+        status);
+#if defined(EXECUTORCH_ARM_HAS_PORTABLE_OP_REGISTRATION)
+    status = executorch_arm_register_portable_ops();
+    ET_CHECK_MSG(
+        status == Error::Ok,
+        "Failed to register portable kernels: 0x%" PRIx32,
+        status);
+#endif
+  }
+#endif
   std::vector<std::pair<char*, size_t>> input_buffers;
   const uint8_t* model_data = nullptr;
   size_t model_size = 0;
@@ -1476,7 +1521,7 @@ int main(int argc, const char* argv[]) {
             "Reading input tensor %lu from file %s failed.",
             nbr_inputs,
             input_tensor_filename);
-        _exit(1);
+        runner_exit(1);
       }
       input_buffers.push_back(std::make_pair(buffer, buffer_size));
       ctx.input_filenames.push_back(input_tensor_filename);
@@ -1487,7 +1532,7 @@ int main(int argc, const char* argv[]) {
           read_binary_file(pte_filename, ctx.input_file_allocator.value());
       if (buffer == nullptr) {
         ET_LOG(Error, "Reading pte model from file %s failed.", pte_filename);
-        _exit(1);
+        runner_exit(1);
       }
 
       model_data = reinterpret_cast<const uint8_t*>(buffer);
@@ -1554,7 +1599,7 @@ int main(int argc, const char* argv[]) {
 
   ET_LOG(Info, "Program complete, exiting.");
 #if defined(SEMIHOSTING)
-  _exit(0);
+  runner_exit(0);
 #endif
   ET_LOG(Info, "\04");
   return 0;

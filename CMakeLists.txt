@@ -516,7 +516,9 @@ list(APPEND _common_compile_options $<$<CXX_COMPILER_ID:MSVC>:/wd4996>
      $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-deprecated-declarations>
 )
 # Set default CMAKE_POSITION_INDEPENDENT_CODE behavior if ON or not set
-# (default) (and not for MSVC compiler)
+# (default) (and not for MSVC compiler). Toolchain-specific bare-metal flows
+# that need PIC disabled should set CMAKE_POSITION_INDEPENDENT_CODE=OFF in their
+# own toolchain files or configure scripts.
 if(NOT DEFINED CMAKE_POSITION_INDEPENDENT_CODE
    OR CMAKE_POSITION_INDEPENDENT_CODE
 )

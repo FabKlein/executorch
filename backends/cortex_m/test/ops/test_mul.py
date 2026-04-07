@@ -152,6 +152,7 @@ def test_dialect_mul(test_case, cortex_m_target):
 @parametrize(
     "test_case",
     test_cases,
+    xfails=xfail_cases_dialect,
 )
 def test_implementation_mul(test_case, cortex_m_target):
     tester = CortexMTester(

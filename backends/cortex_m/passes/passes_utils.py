@@ -409,6 +409,19 @@ def to_physical_order(logical_pad: list[int], tensor: torch.Tensor) -> list[int]
     return [logical_pad[_NHWC_DIM_ORDER[i]] for i in range(4)]
 
 
+def is_default_dim_order(tensor: torch.Tensor) -> bool:
+    """Check if a tensor uses the default logical dim order."""
+    dim_order = list(tensor.dim_order())
+    return dim_order == list(range(tensor.ndim))
+
+
+def is_default_or_channels_last(tensor: torch.Tensor) -> bool:
+    """Check if a 4D tensor uses one of the layout forms the backend understands."""
+    if tensor.ndim != 4:
+        return False
+    return is_default_dim_order(tensor) or is_channels_last(tensor)
+
+
 def is_channel_broadcast(tensor1: torch.Tensor, tensor2: torch.Tensor) -> bool:
     """
     Check if tensor1 is broadcasted to tensor2 along channel dimension.
@@ -426,3 +439,25 @@ def is_channel_broadcast(tensor1: torch.Tensor, tensor2: torch.Tensor) -> bool:
     tensor2_channels_only = tensor2.numel() == tensor2.size(1)
 
     return channel_match and (tensor1_channels_only or tensor2_channels_only)
+
+
+def is_float_depthwise_conv(in_channels: int, out_channels: int, groups: int) -> bool:
+    """Classify whether a float conv should use the CMSIS-NN depthwise path.
+
+    Covers both:
+      * PyTorch's explicit grouped-depthwise spelling:
+        groups == in_channels and out_channels == K * in_channels.
+      * The single-input-channel regular-conv spelling:
+        groups == 1, in_channels == 1, out_channels == K.
+
+    The second case is still emitted by PyTorch as a regular convolution, but
+    for the float Cortex-M backend it is mathematically equivalent to depthwise
+    with depth_multiplier == out_channels.  Routing it through the depthwise
+    CMSIS-NN wrapper can therefore be expected in traces even when the source
+    model did not explicitly request grouped convolution.
+    """
+    is_grouped_depthwise = (
+        groups > 1 and (in_channels == groups) and (out_channels % in_channels == 0)
+    )
+    is_single_channel_depthwise = groups == 1 and in_channels == 1
+    return is_grouped_depthwise or is_single_channel_depthwise

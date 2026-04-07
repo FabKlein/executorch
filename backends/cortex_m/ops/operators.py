@@ -11,10 +11,26 @@ from typing import Sequence
 
 import torch
 import torch.nn.functional as F
+from executorch.backends.cortex_m.float_activation_constants import (
+    CMSIS_FLOAT_ACT_HARDSIGMOID,
+    CMSIS_FLOAT_ACT_HARDSWISH,
+    CMSIS_FLOAT_ACT_HARDTANH,
+    CMSIS_FLOAT_ACT_LEAKY_RELU,
+    CMSIS_FLOAT_ACT_NONE,
+    CMSIS_FLOAT_ACT_RELU,
+    CMSIS_FLOAT_ACT_RELU6,
+    CMSIS_FLOAT_ACT_SIGMOID,
+    CMSIS_FLOAT_ACT_TANH,
+)
+from executorch.backends.cortex_m.passes.float_capabilities import (
+    get_cortex_m_float_capabilities,
+)
 from executorch.backends.cortex_m.passes.passes_utils import (
     dequantize_per_tensor_cmsis,
     is_channel_broadcast,
     is_channels_last,
+    is_default_dim_order,
+    is_default_or_channels_last,
     quantize_per_tensor_cmsis,
     requantize_cmsis,
     SHIFT_INT8,
@@ -38,6 +54,29 @@ _EXPLICIT_LAYOUT_EXPERIMENTAL = (
 )
 
 SOFTMAX_INPUT_INTEGER_BITS = 5
+_FLOAT_CAPABILITIES = get_cortex_m_float_capabilities()
+
+
+def _cortex_m_float_enabled(dtype: torch.dtype) -> bool:
+    return _FLOAT_CAPABILITIES.is_float_dtype_enabled(dtype)
+
+
+def _register_fake_if_enabled(op_name: str, dtype: torch.dtype):
+    def decorator(fn):
+        if _cortex_m_float_enabled(dtype):
+            return register_fake(op_name)(fn)  # type: ignore[misc]
+        return fn
+
+    return decorator
+
+
+def _impl_if_enabled(lib: Library, op_name: str, dispatch: str, dtype: torch.dtype):
+    def decorator(fn):
+        if _cortex_m_float_enabled(dtype):
+            return impl(lib, op_name, dispatch)(fn)  # type: ignore[misc]
+        return fn
+
+    return decorator
 
 
 ###
@@ -973,6 +1012,2728 @@ def quantized_conv2d_nhwc_meta(
     return nchw.permute(0, 2, 3, 1).contiguous()
 
 
+# -------------------------------------------------------------------
+# Float arithmetic operators
+# -------------------------------------------------------------------
+
+
+def _define_float_binary_op(op_name: str, dtype: torch.dtype, pt_op) -> None:
+    if not _cortex_m_float_enabled(dtype):
+        return
+
+    expected_dtype_str = "float32" if dtype == torch.float32 else "float16"
+    lib.define(
+        f"{op_name}("
+        "Tensor self, Tensor other, float activation_min, float activation_max"
+        ") -> Tensor"
+    )
+    lib.define(
+        f"{op_name}.out("
+        "Tensor self, Tensor other, float activation_min, float activation_max, "
+        "*, Tensor(a!) out) -> Tensor(a!)"
+    )
+
+    def _meta(
+        self: torch.Tensor,
+        other: torch.Tensor,
+        activation_min: float,
+        activation_max: float,
+    ) -> torch.Tensor:
+        del activation_min, activation_max
+        assert self.dtype == dtype, (
+            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
+            f"got self.dtype={self.dtype}"
+        )
+        assert other.dtype == dtype, (
+            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
+            f"got other.dtype={other.dtype}"
+        )
+        assert self.shape == other.shape or is_channel_broadcast(self, other), (
+            f"Cortex-M {op_name} currently requires same-shape tensors or "
+            f"channel broadcast, got self.shape={self.shape}, "
+            f"other.shape={other.shape}"
+        )
+        output_tensor = self if self.numel() >= other.numel() else other
+        return torch.empty_like(output_tensor)
+
+    def _impl(
+        self: torch.Tensor,
+        other: torch.Tensor,
+        activation_min: float,
+        activation_max: float,
+    ) -> torch.Tensor:
+        assert self.dtype == dtype, (
+            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
+            f"got self.dtype={self.dtype}"
+        )
+        assert other.dtype == dtype, (
+            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
+            f"got other.dtype={other.dtype}"
+        )
+        assert self.shape == other.shape or is_channel_broadcast(self, other), (
+            f"Cortex-M {op_name} currently requires same-shape tensors or "
+            f"channel broadcast, got self.shape={self.shape}, "
+            f"other.shape={other.shape}"
+        )
+        return torch.clamp(pt_op(self, other), min=activation_min, max=activation_max)
+
+    register_fake(f"cortex_m::{op_name}")(_meta)  # type: ignore[misc]
+    impl(lib, op_name, "CompositeExplicitAutograd")(_impl)  # type: ignore[misc]
+
+
+_define_float_binary_op("add_f32", torch.float32, lambda a, b: a + b)
+_define_float_binary_op("add_f16", torch.float16, lambda a, b: a + b)
+_define_float_binary_op("mul_f32", torch.float32, lambda a, b: a * b)
+_define_float_binary_op("mul_f16", torch.float16, lambda a, b: a * b)
+
+
+# -------------------------------------------------------------------
+# Float batched matmul operators
+# -------------------------------------------------------------------
+# Packed RHS uses the same backend contract as the C++ kernel:
+#   unpacked rhs_transposed : [B, N, K]
+#   packed rhs_transposed   : flat rank-1 buffer + rhs_cols=N metadata
+lib.define(
+    "batch_matmul_f32(Tensor lhs, Tensor rhs_transposed, bool rhs_is_packed, int rhs_cols, float activation_min, float activation_max) -> Tensor"
+)
+lib.define(
+    "batch_matmul_f32.out(Tensor lhs, Tensor rhs_transposed, bool rhs_is_packed, int rhs_cols, float activation_min, float activation_max, *, Tensor(a!) out) -> Tensor(a!)"
+)
+lib.define(
+    "batch_matmul_f16(Tensor lhs, Tensor rhs_transposed, bool rhs_is_packed, int rhs_cols, float activation_min, float activation_max) -> Tensor"
+)
+lib.define(
+    "batch_matmul_f16.out(Tensor lhs, Tensor rhs_transposed, bool rhs_is_packed, int rhs_cols, float activation_min, float activation_max, *, Tensor(a!) out) -> Tensor(a!)"
+)
+
+
+def _float_batch_matmul_meta(
+    lhs: torch.Tensor,
+    rhs_transposed: torch.Tensor,
+    rhs_is_packed: bool,
+    rhs_cols: int,
+) -> torch.Tensor:
+    assert lhs.dtype == rhs_transposed.dtype, (
+        "Cortex-M float batch_matmul: lhs/rhs dtype mismatch — "
+        f"got lhs.dtype={lhs.dtype}, rhs.dtype={rhs_transposed.dtype}"
+    )
+    assert lhs.dim() == 3, (
+        "Cortex-M float batch_matmul: lhs must be rank-3 — "
+        f"got lhs.dim()={lhs.dim()}"
+    )
+    batch, lhs_rows, inner = lhs.shape
+    if rhs_is_packed:
+        # Packed buffers are opaque kernel data, so the logical output column
+        # count N is carried separately through rhs_cols. The K dimension is the
+        # lhs inner dimension.
+        assert rhs_transposed.dim() == 1, (
+            "Cortex-M float batch_matmul: packed rhs_transposed must be rank-1 — "
+            f"got rhs_transposed.dim()={rhs_transposed.dim()}"
+        )
+        assert rhs_cols > 0, "Cortex-M float batch_matmul: rhs_cols must be > 0"
+    else:
+        assert rhs_transposed.dim() == 3, (
+            "Cortex-M float batch_matmul: rhs_transposed must be rank-3 when unpacked — "
+            f"got rhs_transposed.dim()={rhs_transposed.dim()}"
+        )
+        rhs_batch, rhs_cols_actual, rhs_inner = rhs_transposed.shape
+        assert batch == rhs_batch and inner == rhs_inner, (
+            "Cortex-M float batch_matmul: shape mismatch — "
+            f"lhs.shape={tuple(lhs.shape)}, rhs_transposed.shape={tuple(rhs_transposed.shape)}"
+        )
+        if rhs_cols > 0:
+            assert rhs_cols == rhs_cols_actual, (
+                "Cortex-M float batch_matmul: rhs_cols argument mismatch — "
+                f"got rhs_cols={rhs_cols}, rhs_transposed.shape[1]={rhs_cols_actual}"
+            )
+        rhs_cols = rhs_cols_actual
+    return torch.empty((batch, lhs_rows, rhs_cols), dtype=lhs.dtype, device=lhs.device)
+
+
+@_register_fake_if_enabled("cortex_m::batch_matmul_f32", torch.float32)
+def batch_matmul_f32_meta(
+    lhs: torch.Tensor,
+    rhs_transposed: torch.Tensor,
+    rhs_is_packed: bool,
+    rhs_cols: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _float_batch_matmul_meta(lhs, rhs_transposed, rhs_is_packed, rhs_cols)
+
+
+@_register_fake_if_enabled("cortex_m::batch_matmul_f16", torch.float16)
+def batch_matmul_f16_meta(
+    lhs: torch.Tensor,
+    rhs_transposed: torch.Tensor,
+    rhs_is_packed: bool,
+    rhs_cols: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _float_batch_matmul_meta(lhs, rhs_transposed, rhs_is_packed, rhs_cols)
+
+
+def _float_batch_matmul_impl(
+    lhs: torch.Tensor,
+    rhs_transposed: torch.Tensor,
+    rhs_is_packed: bool,
+    rhs_cols: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    if rhs_is_packed:
+        # Python reference path for offline-packed RHS.
+        #
+        # Logical BMM contract:
+        #
+        #   lhs            [B, M, K]
+        #   rhs_transposed [B, N, K]
+        #   out            [B, M, N]
+        #
+        # Packed storage groups N rows into CMSIS-NN lane blocks:
+        #
+        #   packed[batch, n_block, k, lane] = rhs_transposed[batch, n, k]
+        #
+        # where n = n_block * block_cols + lane and N is padded up to
+        # block_cols. The public schema only carries the flat packed tensor,
+        # so rhs_cols is the original, unpadded N used to crop the unpacked
+        # reference tensor back to logical shape.
+        block_cols = 8 if lhs.dtype == torch.float16 else 4
+        batch = lhs.shape[0]
+        inner = lhs.shape[2]
+        packed_blocks = (rhs_cols + block_cols - 1) // block_cols
+        packed_4d = rhs_transposed.reshape(batch, packed_blocks, inner, block_cols)
+        unpacked = torch.zeros(
+            (batch, packed_blocks * block_cols, inner),
+            dtype=lhs.dtype,
+            device=lhs.device,
+        )
+        for batch_idx in range(batch):
+            for out_row in range(packed_blocks * block_cols):
+                block = out_row // block_cols
+                lane = out_row % block_cols
+                unpacked[batch_idx, out_row].copy_(packed_4d[batch_idx, block, :, lane])
+        rhs_transposed = unpacked[:, :rhs_cols, :]
+    else:
+        del rhs_cols
+    rhs = rhs_transposed.permute(0, 2, 1)
+    result = torch.bmm(lhs, rhs)
+    return torch.clamp(result, min=activation_min, max=activation_max)
+
+
+@_impl_if_enabled(lib, "batch_matmul_f32", "CompositeExplicitAutograd", torch.float32)
+def batch_matmul_f32_impl(
+    lhs: torch.Tensor,
+    rhs_transposed: torch.Tensor,
+    rhs_is_packed: bool,
+    rhs_cols: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _float_batch_matmul_impl(
+        lhs, rhs_transposed, rhs_is_packed, rhs_cols, activation_min, activation_max
+    )
+
+
+@_impl_if_enabled(lib, "batch_matmul_f16", "CompositeExplicitAutograd", torch.float16)
+def batch_matmul_f16_impl(
+    lhs: torch.Tensor,
+    rhs_transposed: torch.Tensor,
+    rhs_is_packed: bool,
+    rhs_cols: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _float_batch_matmul_impl(
+        lhs, rhs_transposed, rhs_is_packed, rhs_cols, activation_min, activation_max
+    )
+
+
+lib.define(
+    "linear_f32.out("
+    "Tensor input, "
+    "Tensor weights, "
+    "Tensor? bias, "
+    "bool weight_is_packed, "
+    "int packed_out_features, "
+    "float activation_min, "
+    "float activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+lib.define(
+    "linear_f32("
+    "Tensor input, "
+    "Tensor weights, "
+    "Tensor? bias, "
+    "bool weight_is_packed, "
+    "int packed_out_features, "
+    "float activation_min, "
+    "float activation_max"
+    ") -> Tensor"
+)
+
+lib.define(
+    "linear_f16.out("
+    "Tensor input, "
+    "Tensor weights, "
+    "Tensor? bias, "
+    "bool weight_is_packed, "
+    "int packed_out_features, "
+    "float activation_min, "
+    "float activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+lib.define(
+    "linear_f16("
+    "Tensor input, "
+    "Tensor weights, "
+    "Tensor? bias, "
+    "bool weight_is_packed, "
+    "int packed_out_features, "
+    "float activation_min, "
+    "float activation_max"
+    ") -> Tensor"
+)
+
+
+def _float_linear_meta_impl(
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    bias: torch.Tensor | None,
+    weight_is_packed: bool,
+    packed_out_features: int,
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    # Standard linear weights are rank-2 [O, I]. Offline-packed weights become
+    # an opaque rank-1 buffer, so packed_out_features carries the logical O.
+    assert (
+        input.dtype == expected_dtype
+    ), f"Cortex-M float linear expects input dtype={expected_dtype}, got {input.dtype}"
+    assert (
+        weights.dtype == expected_dtype
+    ), f"Cortex-M float linear expects weights dtype={expected_dtype}, got {weights.dtype}"
+    assert input.dim() >= 1, "Cortex-M float linear expects input rank >= 1"
+    if weight_is_packed:
+        assert weights.dim() == 1, (
+            "Cortex-M float linear expects rank-1 packed weights when "
+            "weight_is_packed=True"
+        )
+    else:
+        assert weights.dim() == 2, "Cortex-M float linear expects rank-2 weights"
+    out_features = packed_out_features if weight_is_packed else weights.shape[0]
+    if weight_is_packed:
+        assert out_features > 0, (
+            "Cortex-M float linear expects packed_out_features > 0 when "
+            "weight_is_packed=True"
+        )
+    block_cols = 8 if expected_dtype == torch.float16 else 4
+    logical_in_features = (
+        weights.numel()
+        // (((out_features + block_cols - 1) // block_cols) * block_cols)
+        if weight_is_packed
+        else int(weights.shape[1])
+    )
+    direct_nhwc_input_features = None
+    nhwc_input_to_matrix_output = False
+    if input.dim() == 4 and is_channels_last(input):
+        direct_nhwc_input_features = input.shape[1] * input.shape[2] * input.shape[3]
+        nhwc_input_to_matrix_output = direct_nhwc_input_features == logical_in_features
+    if nhwc_input_to_matrix_output:
+        input_features = direct_nhwc_input_features
+        assert input_features is not None
+        assert input_features == logical_in_features, (
+            "Cortex-M float linear expects channels-last 4D input with "
+            "C*H*W == logical in_features, "
+            f"got {tuple(input.shape)} vs logical_in_features={logical_in_features}"
+        )
+    else:
+        input_last_dim = input.shape[-1]
+        if not weight_is_packed and input_last_dim == 0 and weights.shape[1] > 0:
+            # Some export paths can transiently report a flattened size of 0
+            # even though the stabilized edge graph carries the correct shape.
+            # Use the weight metadata as the source of truth for this
+            # export-time case.
+            input_last_dim = weights.shape[1]
+        assert input_last_dim == logical_in_features, (
+            "Cortex-M float linear expects input.shape[-1] == logical in_features, "
+            f"got {input.shape[-1]} vs {logical_in_features}"
+        )
+    if bias is not None:
+        assert (
+            bias.dtype == expected_dtype
+        ), f"Cortex-M float linear expects bias dtype={expected_dtype}, got {bias.dtype}"
+        assert bias.dim() == 1 and bias.shape[0] == out_features, (
+            "Cortex-M float linear expects bias shape [out_features], "
+            f"got bias.shape={tuple(bias.shape)}, out_features={out_features}"
+        )
+    output_shape = (
+        (input.shape[0], out_features)
+        if nhwc_input_to_matrix_output
+        else (*input.shape[:-1], out_features)
+    )
+    return torch.empty(output_shape, dtype=expected_dtype, device=input.device)
+
+
+def _float_linear_impl(
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    bias: torch.Tensor | None,
+    weight_is_packed: bool,
+    packed_out_features: int,
+    activation_min: float,
+    activation_max: float,
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    _float_linear_meta_impl(
+        input, weights, bias, weight_is_packed, packed_out_features, expected_dtype
+    )
+    if weight_is_packed:
+        block_cols = 8 if expected_dtype == torch.float16 else 4
+        in_features = weights.numel() // (
+            ((packed_out_features + block_cols - 1) // block_cols) * block_cols
+        )
+        packed_blocks = (packed_out_features + block_cols - 1) // block_cols
+        packed_3d = weights.reshape(packed_blocks, in_features, block_cols)
+        unpacked = torch.zeros(
+            (packed_out_features, in_features),
+            dtype=expected_dtype,
+            device=input.device,
+        )
+        for out_feature in range(packed_out_features):
+            block = out_feature // block_cols
+            lane = out_feature % block_cols
+            unpacked[out_feature].copy_(packed_3d[block, :, lane])
+        weights = unpacked
+    nhwc_input_to_matrix_output = (
+        input.dim() == 4
+        and is_channels_last(input)
+        and input.shape[1] * input.shape[2] * input.shape[3] == weights.shape[1]
+    )
+    if nhwc_input_to_matrix_output:
+        input = input.permute(0, 2, 3, 1).reshape(input.shape[0], -1)
+    out = F.linear(input, weights, bias)
+    return torch.clamp(out, min=activation_min, max=activation_max)
+
+
+@_register_fake_if_enabled("cortex_m::linear_f32", torch.float32)
+def linear_f32_meta(
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    bias: torch.Tensor | None,
+    weight_is_packed: bool,
+    packed_out_features: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del activation_min, activation_max
+    return _float_linear_meta_impl(
+        input, weights, bias, weight_is_packed, packed_out_features, torch.float32
+    )
+
+
+@_impl_if_enabled(lib, "linear_f32", "CompositeExplicitAutograd", torch.float32)
+def linear_f32_impl(
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    bias: torch.Tensor | None,
+    weight_is_packed: bool,
+    packed_out_features: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _float_linear_impl(
+        input,
+        weights,
+        bias,
+        weight_is_packed,
+        packed_out_features,
+        activation_min,
+        activation_max,
+        torch.float32,
+    )
+
+
+@_register_fake_if_enabled("cortex_m::linear_f16", torch.float16)
+def linear_f16_meta(
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    bias: torch.Tensor | None,
+    weight_is_packed: bool,
+    packed_out_features: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del activation_min, activation_max
+    return _float_linear_meta_impl(
+        input, weights, bias, weight_is_packed, packed_out_features, torch.float16
+    )
+
+
+@_impl_if_enabled(lib, "linear_f16", "CompositeExplicitAutograd", torch.float16)
+def linear_f16_impl(
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    bias: torch.Tensor | None,
+    weight_is_packed: bool,
+    packed_out_features: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _float_linear_impl(
+        input,
+        weights,
+        bias,
+        weight_is_packed,
+        packed_out_features,
+        activation_min,
+        activation_max,
+        torch.float16,
+    )
+
+
+lib.define(
+    "lstm_unidirectional_f32.out("
+    "Tensor input, "
+    "Tensor forget_input_weights, Tensor forget_hidden_weights, Tensor forget_bias, "
+    "Tensor input_input_weights, Tensor input_hidden_weights, Tensor input_bias, "
+    "Tensor cell_input_weights, Tensor cell_hidden_weights, Tensor cell_bias, "
+    "Tensor output_input_weights, Tensor output_hidden_weights, Tensor output_bias, "
+    "bool time_major, float cell_clip, *, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+lib.define(
+    "lstm_unidirectional_f32("
+    "Tensor input, "
+    "Tensor forget_input_weights, Tensor forget_hidden_weights, Tensor forget_bias, "
+    "Tensor input_input_weights, Tensor input_hidden_weights, Tensor input_bias, "
+    "Tensor cell_input_weights, Tensor cell_hidden_weights, Tensor cell_bias, "
+    "Tensor output_input_weights, Tensor output_hidden_weights, Tensor output_bias, "
+    "bool time_major, float cell_clip"
+    ") -> Tensor"
+)
+
+lib.define(
+    "lstm_unidirectional_f16.out("
+    "Tensor input, "
+    "Tensor forget_input_weights, Tensor forget_hidden_weights, Tensor forget_bias, "
+    "Tensor input_input_weights, Tensor input_hidden_weights, Tensor input_bias, "
+    "Tensor cell_input_weights, Tensor cell_hidden_weights, Tensor cell_bias, "
+    "Tensor output_input_weights, Tensor output_hidden_weights, Tensor output_bias, "
+    "bool time_major, float cell_clip, *, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+lib.define(
+    "lstm_unidirectional_f16("
+    "Tensor input, "
+    "Tensor forget_input_weights, Tensor forget_hidden_weights, Tensor forget_bias, "
+    "Tensor input_input_weights, Tensor input_hidden_weights, Tensor input_bias, "
+    "Tensor cell_input_weights, Tensor cell_hidden_weights, Tensor cell_bias, "
+    "Tensor output_input_weights, Tensor output_hidden_weights, Tensor output_bias, "
+    "bool time_major, float cell_clip"
+    ") -> Tensor"
+)
+
+
+def _float_lstm_output_shape(
+    input: torch.Tensor, hidden_size: int, time_major: bool
+) -> tuple[int, ...]:
+    if time_major:
+        time_steps, batch_size, _ = input.shape
+        return (time_steps, batch_size, hidden_size)
+    batch_size, time_steps, _ = input.shape
+    return (batch_size, time_steps, hidden_size)
+
+
+def _validate_float_lstm_gate(
+    gate_name: str,
+    input_weights: torch.Tensor,
+    hidden_weights: torch.Tensor,
+    bias: torch.Tensor,
+    expected_dtype: torch.dtype,
+    input_size: int,
+    hidden_size: int,
+) -> None:
+    assert (
+        input_weights.dtype == expected_dtype
+    ), f"{gate_name} input weights must use dtype={expected_dtype}, got {input_weights.dtype}"
+    assert (
+        hidden_weights.dtype == expected_dtype
+    ), f"{gate_name} hidden weights must use dtype={expected_dtype}, got {hidden_weights.dtype}"
+    assert (
+        bias.dtype == expected_dtype
+    ), f"{gate_name} bias must use dtype={expected_dtype}, got {bias.dtype}"
+    assert input_weights.shape == (hidden_size, input_size), (
+        f"{gate_name} input weights must have shape ({hidden_size}, {input_size}), "
+        f"got {tuple(input_weights.shape)}"
+    )
+    assert hidden_weights.shape == (hidden_size, hidden_size), (
+        f"{gate_name} hidden weights must have shape ({hidden_size}, {hidden_size}), "
+        f"got {tuple(hidden_weights.shape)}"
+    )
+    assert bias.shape == (
+        hidden_size,
+    ), f"{gate_name} bias must have shape ({hidden_size},), got {tuple(bias.shape)}"
+
+
+def _float_lstm_meta_impl(
+    input: torch.Tensor,
+    forget_input_weights: torch.Tensor,
+    forget_hidden_weights: torch.Tensor,
+    forget_bias: torch.Tensor,
+    input_input_weights: torch.Tensor,
+    input_hidden_weights: torch.Tensor,
+    input_bias: torch.Tensor,
+    cell_input_weights: torch.Tensor,
+    cell_hidden_weights: torch.Tensor,
+    cell_bias: torch.Tensor,
+    output_input_weights: torch.Tensor,
+    output_hidden_weights: torch.Tensor,
+    output_bias: torch.Tensor,
+    time_major: bool,
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    assert (
+        input.dtype == expected_dtype
+    ), f"Cortex-M float LSTM expects input dtype={expected_dtype}, got {input.dtype}"
+    assert (
+        input.dim() == 3
+    ), f"Cortex-M float LSTM expects rank-3 input, got rank {input.dim()}"
+    input_size = input.shape[-1]
+    hidden_size = forget_bias.shape[0]
+    _validate_float_lstm_gate(
+        "forget_gate",
+        forget_input_weights,
+        forget_hidden_weights,
+        forget_bias,
+        expected_dtype,
+        input_size,
+        hidden_size,
+    )
+    _validate_float_lstm_gate(
+        "input_gate",
+        input_input_weights,
+        input_hidden_weights,
+        input_bias,
+        expected_dtype,
+        input_size,
+        hidden_size,
+    )
+    _validate_float_lstm_gate(
+        "cell_gate",
+        cell_input_weights,
+        cell_hidden_weights,
+        cell_bias,
+        expected_dtype,
+        input_size,
+        hidden_size,
+    )
+    _validate_float_lstm_gate(
+        "output_gate",
+        output_input_weights,
+        output_hidden_weights,
+        output_bias,
+        expected_dtype,
+        input_size,
+        hidden_size,
+    )
+    return torch.empty(
+        _float_lstm_output_shape(input, hidden_size, time_major),
+        dtype=expected_dtype,
+        device=input.device,
+    )
+
+
+def _float_lstm_impl(
+    input: torch.Tensor,
+    forget_input_weights: torch.Tensor,
+    forget_hidden_weights: torch.Tensor,
+    forget_bias: torch.Tensor,
+    input_input_weights: torch.Tensor,
+    input_hidden_weights: torch.Tensor,
+    input_bias: torch.Tensor,
+    cell_input_weights: torch.Tensor,
+    cell_hidden_weights: torch.Tensor,
+    cell_bias: torch.Tensor,
+    output_input_weights: torch.Tensor,
+    output_hidden_weights: torch.Tensor,
+    output_bias: torch.Tensor,
+    time_major: bool,
+    cell_clip: float,
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    _float_lstm_meta_impl(
+        input,
+        forget_input_weights,
+        forget_hidden_weights,
+        forget_bias,
+        input_input_weights,
+        input_hidden_weights,
+        input_bias,
+        cell_input_weights,
+        cell_hidden_weights,
+        cell_bias,
+        output_input_weights,
+        output_hidden_weights,
+        output_bias,
+        time_major,
+        expected_dtype,
+    )
+
+    sequence = input if time_major else input.transpose(0, 1)
+    time_steps, batch_size, _ = sequence.shape
+    hidden_size = forget_bias.shape[0]
+    h = torch.zeros(
+        (batch_size, hidden_size), dtype=expected_dtype, device=input.device
+    )
+    c = torch.zeros(
+        (batch_size, hidden_size), dtype=expected_dtype, device=input.device
+    )
+    outputs = []
+
+    def gate(
+        x_t: torch.Tensor,
+        input_w: torch.Tensor,
+        hidden_w: torch.Tensor,
+        bias: torch.Tensor,
+        activation: str,
+    ) -> torch.Tensor:
+        logits = F.linear(x_t, input_w) + F.linear(h, hidden_w) + bias
+        if activation == "sigmoid":
+            return torch.sigmoid(logits)
+        if activation == "tanh":
+            return torch.tanh(logits)
+        raise AssertionError(f"Unsupported LSTM gate activation {activation}")
+
+    for t in range(time_steps):
+        x_t = sequence[t]
+        f = gate(
+            x_t,
+            forget_input_weights,
+            forget_hidden_weights,
+            forget_bias,
+            "sigmoid",
+        )
+        i = gate(
+            x_t,
+            input_input_weights,
+            input_hidden_weights,
+            input_bias,
+            "sigmoid",
+        )
+        g = gate(
+            x_t,
+            cell_input_weights,
+            cell_hidden_weights,
+            cell_bias,
+            "tanh",
+        )
+        o = gate(
+            x_t,
+            output_input_weights,
+            output_hidden_weights,
+            output_bias,
+            "sigmoid",
+        )
+        c = f * c + i * g
+        if cell_clip > 0:
+            c = torch.clamp(c, min=-cell_clip, max=cell_clip)
+        h = o * torch.tanh(c)
+        outputs.append(h)
+
+    output = torch.stack(outputs, dim=0)
+    return output if time_major else output.transpose(0, 1)
+
+
+@_register_fake_if_enabled("cortex_m::lstm_unidirectional_f32", torch.float32)
+def lstm_unidirectional_f32_meta(
+    input: torch.Tensor,
+    forget_input_weights: torch.Tensor,
+    forget_hidden_weights: torch.Tensor,
+    forget_bias: torch.Tensor,
+    input_input_weights: torch.Tensor,
+    input_hidden_weights: torch.Tensor,
+    input_bias: torch.Tensor,
+    cell_input_weights: torch.Tensor,
+    cell_hidden_weights: torch.Tensor,
+    cell_bias: torch.Tensor,
+    output_input_weights: torch.Tensor,
+    output_hidden_weights: torch.Tensor,
+    output_bias: torch.Tensor,
+    time_major: bool,
+    cell_clip: float,
+) -> torch.Tensor:
+    del cell_clip
+    return _float_lstm_meta_impl(
+        input,
+        forget_input_weights,
+        forget_hidden_weights,
+        forget_bias,
+        input_input_weights,
+        input_hidden_weights,
+        input_bias,
+        cell_input_weights,
+        cell_hidden_weights,
+        cell_bias,
+        output_input_weights,
+        output_hidden_weights,
+        output_bias,
+        time_major,
+        torch.float32,
+    )
+
+
+@_impl_if_enabled(
+    lib, "lstm_unidirectional_f32", "CompositeExplicitAutograd", torch.float32
+)
+def lstm_unidirectional_f32_impl(
+    input: torch.Tensor,
+    forget_input_weights: torch.Tensor,
+    forget_hidden_weights: torch.Tensor,
+    forget_bias: torch.Tensor,
+    input_input_weights: torch.Tensor,
+    input_hidden_weights: torch.Tensor,
+    input_bias: torch.Tensor,
+    cell_input_weights: torch.Tensor,
+    cell_hidden_weights: torch.Tensor,
+    cell_bias: torch.Tensor,
+    output_input_weights: torch.Tensor,
+    output_hidden_weights: torch.Tensor,
+    output_bias: torch.Tensor,
+    time_major: bool,
+    cell_clip: float,
+) -> torch.Tensor:
+    return _float_lstm_impl(
+        input,
+        forget_input_weights,
+        forget_hidden_weights,
+        forget_bias,
+        input_input_weights,
+        input_hidden_weights,
+        input_bias,
+        cell_input_weights,
+        cell_hidden_weights,
+        cell_bias,
+        output_input_weights,
+        output_hidden_weights,
+        output_bias,
+        time_major,
+        cell_clip,
+        torch.float32,
+    )
+
+
+@_register_fake_if_enabled("cortex_m::lstm_unidirectional_f16", torch.float16)
+def lstm_unidirectional_f16_meta(
+    input: torch.Tensor,
+    forget_input_weights: torch.Tensor,
+    forget_hidden_weights: torch.Tensor,
+    forget_bias: torch.Tensor,
+    input_input_weights: torch.Tensor,
+    input_hidden_weights: torch.Tensor,
+    input_bias: torch.Tensor,
+    cell_input_weights: torch.Tensor,
+    cell_hidden_weights: torch.Tensor,
+    cell_bias: torch.Tensor,
+    output_input_weights: torch.Tensor,
+    output_hidden_weights: torch.Tensor,
+    output_bias: torch.Tensor,
+    time_major: bool,
+    cell_clip: float,
+) -> torch.Tensor:
+    del cell_clip
+    return _float_lstm_meta_impl(
+        input,
+        forget_input_weights,
+        forget_hidden_weights,
+        forget_bias,
+        input_input_weights,
+        input_hidden_weights,
+        input_bias,
+        cell_input_weights,
+        cell_hidden_weights,
+        cell_bias,
+        output_input_weights,
+        output_hidden_weights,
+        output_bias,
+        time_major,
+        torch.float16,
+    )
+
+
+@_impl_if_enabled(
+    lib, "lstm_unidirectional_f16", "CompositeExplicitAutograd", torch.float16
+)
+def lstm_unidirectional_f16_impl(
+    input: torch.Tensor,
+    forget_input_weights: torch.Tensor,
+    forget_hidden_weights: torch.Tensor,
+    forget_bias: torch.Tensor,
+    input_input_weights: torch.Tensor,
+    input_hidden_weights: torch.Tensor,
+    input_bias: torch.Tensor,
+    cell_input_weights: torch.Tensor,
+    cell_hidden_weights: torch.Tensor,
+    cell_bias: torch.Tensor,
+    output_input_weights: torch.Tensor,
+    output_hidden_weights: torch.Tensor,
+    output_bias: torch.Tensor,
+    time_major: bool,
+    cell_clip: float,
+) -> torch.Tensor:
+    return _float_lstm_impl(
+        input,
+        forget_input_weights,
+        forget_hidden_weights,
+        forget_bias,
+        input_input_weights,
+        input_hidden_weights,
+        input_bias,
+        cell_input_weights,
+        cell_hidden_weights,
+        cell_bias,
+        output_input_weights,
+        output_hidden_weights,
+        output_bias,
+        time_major,
+        cell_clip,
+        torch.float16,
+    )
+
+
+# ===================================================================
+# SOFTMAX OPERATION DEFINITION
+# ===================================================================
+
+lib.define("softmax_f32(Tensor input, int dim) -> Tensor")
+lib.define("softmax_f32.out(Tensor input, int dim, *, Tensor(a!) out) -> Tensor(a!)")
+
+
+@_register_fake_if_enabled("cortex_m::softmax_f32", torch.float32)
+def softmax_f32_meta(input: torch.Tensor, dim: int) -> torch.Tensor:
+    del dim
+    return torch.empty_like(input, dtype=torch.float32)
+
+
+@_impl_if_enabled(lib, "softmax_f32", "CompositeExplicitAutograd", torch.float32)
+def softmax_f32_impl(input: torch.Tensor, dim: int) -> torch.Tensor:
+    if input.dtype != torch.float32:
+        raise TypeError(
+            f"cortex_m.softmax_f32: expected float32 input tensor, got {input.dtype}"
+        )
+    return torch.softmax(input, dim=dim)
+
+
+lib.define("softmax_f16(Tensor input, int dim) -> Tensor")
+lib.define("softmax_f16.out(Tensor input, int dim, *, Tensor(a!) out) -> Tensor(a!)")
+lib.define(
+    "activation_f32(Tensor input, int activation_type, float act_param) -> Tensor"
+)
+lib.define(
+    "activation_f32.out(Tensor input, int activation_type, float act_param, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+lib.define(
+    "activation_f16(Tensor input, int activation_type, float act_param) -> Tensor"
+)
+lib.define(
+    "activation_f16.out(Tensor input, int activation_type, float act_param, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+lib.define("batch_norm_f32(Tensor input, Tensor scale, Tensor bias) -> Tensor")
+lib.define(
+    "batch_norm_f32.out(Tensor input, Tensor scale, Tensor bias, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+lib.define("batch_norm_f16(Tensor input, Tensor scale, Tensor bias) -> Tensor")
+lib.define(
+    "batch_norm_f16.out(Tensor input, Tensor scale, Tensor bias, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+lib.define(
+    "batch_norm_native_f32("
+    "Tensor input, Tensor weight, Tensor bias, Tensor running_mean, Tensor running_var, float eps"
+    ") -> Tensor"
+)
+lib.define(
+    "batch_norm_native_f32.out("
+    "Tensor input, Tensor weight, Tensor bias, Tensor running_mean, Tensor running_var, float eps, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+lib.define(
+    "batch_norm_native_f16("
+    "Tensor input, Tensor weight, Tensor bias, Tensor running_mean, Tensor running_var, float eps"
+    ") -> Tensor"
+)
+lib.define(
+    "batch_norm_native_f16.out("
+    "Tensor input, Tensor weight, Tensor bias, Tensor running_mean, Tensor running_var, float eps, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+lib.define(
+    "svdf_f32("
+    "Tensor input, Tensor initial_state, Tensor weights_feature, Tensor weights_time, "
+    "Tensor bias, bool time_major, int rank, "
+    "float input_activation_min, float input_activation_max, "
+    "float output_activation_min, float output_activation_max"
+    ") -> Tensor"
+)
+lib.define(
+    "svdf_f32.out("
+    "Tensor input, Tensor initial_state, Tensor weights_feature, Tensor weights_time, "
+    "Tensor bias, bool time_major, int rank, "
+    "float input_activation_min, float input_activation_max, "
+    "float output_activation_min, float output_activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+lib.define(
+    "svdf_f16("
+    "Tensor input, Tensor initial_state, Tensor weights_feature, Tensor weights_time, "
+    "Tensor bias, bool time_major, int rank, "
+    "float input_activation_min, float input_activation_max, "
+    "float output_activation_min, float output_activation_max"
+    ") -> Tensor"
+)
+lib.define(
+    "svdf_f16.out("
+    "Tensor input, Tensor initial_state, Tensor weights_feature, Tensor weights_time, "
+    "Tensor bias, bool time_major, int rank, "
+    "float input_activation_min, float input_activation_max, "
+    "float output_activation_min, float output_activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@_register_fake_if_enabled("cortex_m::softmax_f16", torch.float16)
+def softmax_f16_meta(input: torch.Tensor, dim: int) -> torch.Tensor:
+    del dim
+    return torch.empty_like(input, dtype=torch.float16)
+
+
+@_impl_if_enabled(lib, "softmax_f16", "CompositeExplicitAutograd", torch.float16)
+def softmax_f16_impl(input: torch.Tensor, dim: int) -> torch.Tensor:
+    if input.dtype != torch.float16:
+        raise TypeError(
+            f"cortex_m.softmax_f16: expected float16 input tensor, got {input.dtype}"
+        )
+    return torch.softmax(input, dim=dim)
+
+
+def _activation_meta_float(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if input.ndim == 4 and input.is_contiguous(memory_format=torch.channels_last):
+        return torch.empty(
+            input.shape,
+            dtype=dtype,
+            device=input.device,
+            memory_format=torch.channels_last,
+        )
+    return torch.empty_like(input, dtype=dtype)
+
+
+def _activation_impl_float(
+    input: torch.Tensor, activation_type: int, act_param: float, dtype: torch.dtype
+) -> torch.Tensor:
+    if input.dtype != dtype:
+        raise TypeError(
+            f"cortex_m.activation: expected {dtype} input tensor, got {input.dtype}"
+        )
+
+    x = input
+    channels_last_4d = x.ndim == 4 and x.is_contiguous(
+        memory_format=torch.channels_last
+    )
+    if activation_type == CMSIS_FLOAT_ACT_NONE:
+        out = x.clone()
+        return (
+            out.contiguous(memory_format=torch.channels_last)
+            if channels_last_4d
+            else out
+        )
+    if activation_type == CMSIS_FLOAT_ACT_SIGMOID:
+        out = torch.sigmoid(x)
+        return (
+            out.contiguous(memory_format=torch.channels_last)
+            if channels_last_4d
+            else out
+        )
+    if activation_type == CMSIS_FLOAT_ACT_TANH:
+        out = torch.tanh(x)
+        return (
+            out.contiguous(memory_format=torch.channels_last)
+            if channels_last_4d
+            else out
+        )
+    if activation_type == CMSIS_FLOAT_ACT_RELU:
+        out = torch.relu(x)
+        return (
+            out.contiguous(memory_format=torch.channels_last)
+            if channels_last_4d
+            else out
+        )
+    if activation_type == CMSIS_FLOAT_ACT_RELU6:
+        out = torch.clamp(x, min=0.0, max=6.0)
+        return (
+            out.contiguous(memory_format=torch.channels_last)
+            if channels_last_4d
+            else out
+        )
+    if activation_type == CMSIS_FLOAT_ACT_HARDSWISH:
+        out = torch.nn.functional.hardswish(x)
+        return (
+            out.contiguous(memory_format=torch.channels_last)
+            if channels_last_4d
+            else out
+        )
+    if activation_type == CMSIS_FLOAT_ACT_LEAKY_RELU:
+        out = torch.nn.functional.leaky_relu(x, negative_slope=float(act_param))
+        return (
+            out.contiguous(memory_format=torch.channels_last)
+            if channels_last_4d
+            else out
+        )
+    if activation_type == CMSIS_FLOAT_ACT_HARDSIGMOID:
+        out = torch.nn.functional.hardsigmoid(x)
+        return (
+            out.contiguous(memory_format=torch.channels_last)
+            if channels_last_4d
+            else out
+        )
+    if activation_type == CMSIS_FLOAT_ACT_HARDTANH:
+        out = torch.clamp(x, min=-1.0, max=1.0)
+        return (
+            out.contiguous(memory_format=torch.channels_last)
+            if channels_last_4d
+            else out
+        )
+    raise ValueError(
+        f"cortex_m.activation: unsupported activation_type {activation_type}"
+    )
+
+
+@_register_fake_if_enabled("cortex_m::activation_f32", torch.float32)
+def activation_f32_meta(
+    input: torch.Tensor, activation_type: int, act_param: float
+) -> torch.Tensor:
+    del activation_type, act_param
+    return _activation_meta_float(input, torch.float32)
+
+
+@_impl_if_enabled(lib, "activation_f32", "CompositeExplicitAutograd", torch.float32)
+def activation_f32_impl(
+    input: torch.Tensor, activation_type: int, act_param: float
+) -> torch.Tensor:
+    return _activation_impl_float(input, activation_type, act_param, torch.float32)
+
+
+@_register_fake_if_enabled("cortex_m::activation_f16", torch.float16)
+def activation_f16_meta(
+    input: torch.Tensor, activation_type: int, act_param: float
+) -> torch.Tensor:
+    del activation_type, act_param
+    return _activation_meta_float(input, torch.float16)
+
+
+@_impl_if_enabled(lib, "activation_f16", "CompositeExplicitAutograd", torch.float16)
+def activation_f16_impl(
+    input: torch.Tensor, activation_type: int, act_param: float
+) -> torch.Tensor:
+    return _activation_impl_float(input, activation_type, act_param, torch.float16)
+
+
+def _batch_norm_meta_float(
+    input: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    assert (
+        input.dtype == dtype
+    ), f"cortex_m.batch_norm: expected {dtype} input tensor, got {input.dtype}"
+    assert (
+        scale.dtype == dtype and bias.dtype == dtype
+    ), f"cortex_m.batch_norm: expected {dtype} scale/bias tensors"
+    assert (
+        input.dim() == 4
+    ), f"cortex_m.batch_norm: expected rank-4 input, got rank {input.dim()}"
+    assert is_default_or_channels_last(
+        input
+    ), "cortex_m.batch_norm: input must use default or channels_last memory format"
+    channels = input.shape[1]
+    assert scale.shape == (
+        channels,
+    ), f"cortex_m.batch_norm: scale must have shape ({channels},), got {tuple(scale.shape)}"
+    assert bias.shape == (
+        channels,
+    ), f"cortex_m.batch_norm: bias must have shape ({channels},), got {tuple(bias.shape)}"
+    return torch.empty_like(input, dtype=dtype)
+
+
+def _batch_norm_impl_float(
+    input: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    _batch_norm_meta_float(input, scale, bias, dtype)
+    scale_view = scale.view(1, -1, 1, 1)
+    bias_view = bias.view(1, -1, 1, 1)
+    # Preserve the incoming layout family so the Python fallback matches the
+    # C++ kernel contract: channels_last stays channels_last, default stays default.
+    output = input * scale_view + bias_view
+    if is_channels_last(input):
+        return output.contiguous(memory_format=torch.channels_last)
+    if is_default_dim_order(input):
+        return output.contiguous()
+    return output
+
+
+@_register_fake_if_enabled("cortex_m::batch_norm_f32", torch.float32)
+def batch_norm_f32_meta(
+    input: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    return _batch_norm_meta_float(input, scale, bias, torch.float32)
+
+
+@_impl_if_enabled(lib, "batch_norm_f32", "CompositeExplicitAutograd", torch.float32)
+def batch_norm_f32_impl(
+    input: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    return _batch_norm_impl_float(input, scale, bias, torch.float32)
+
+
+@_register_fake_if_enabled("cortex_m::batch_norm_f16", torch.float16)
+def batch_norm_f16_meta(
+    input: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    return _batch_norm_meta_float(input, scale, bias, torch.float16)
+
+
+@_impl_if_enabled(lib, "batch_norm_f16", "CompositeExplicitAutograd", torch.float16)
+def batch_norm_f16_impl(
+    input: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    return _batch_norm_impl_float(input, scale, bias, torch.float16)
+
+
+def _batch_norm_native_meta_float(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    assert (
+        input.dtype == dtype
+    ), f"cortex_m.batch_norm_native: expected {dtype} input tensor, got {input.dtype}"
+    assert input.dim() in (
+        2,
+        4,
+    ), f"cortex_m.batch_norm_native: expected rank-2 or rank-4 input, got rank {input.dim()}"
+    if input.dim() == 4:
+        assert is_default_or_channels_last(
+            input
+        ), "cortex_m.batch_norm_native: input must use default or channels_last memory format"
+    channels = input.shape[1]
+    expected = (channels,)
+    for name, tensor in (
+        ("weight", weight),
+        ("bias", bias),
+        ("running_mean", running_mean),
+        ("running_var", running_var),
+    ):
+        assert (
+            tensor.dtype == dtype
+        ), f"cortex_m.batch_norm_native: expected {dtype} {name} tensor, got {tensor.dtype}"
+        assert (
+            tensor.shape == expected
+        ), f"cortex_m.batch_norm_native: {name} must have shape {expected}, got {tuple(tensor.shape)}"
+    return torch.empty_like(input, dtype=dtype)
+
+
+def _batch_norm_native_impl_float(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    eps: float,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    _batch_norm_native_meta_float(input, weight, bias, running_mean, running_var, dtype)
+    output = torch.nn.functional.batch_norm(
+        input,
+        running_mean,
+        running_var,
+        weight,
+        bias,
+        training=False,
+        momentum=0.0,
+        eps=float(eps),
+    )
+    # As above, avoid forcing an unconditional channels-last materialization.
+    if is_channels_last(input):
+        return output.contiguous(memory_format=torch.channels_last)
+    if is_default_dim_order(input):
+        return output.contiguous()
+    return output
+
+
+@_register_fake_if_enabled("cortex_m::batch_norm_native_f32", torch.float32)
+def batch_norm_native_f32_meta(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del eps
+    return _batch_norm_native_meta_float(
+        input, weight, bias, running_mean, running_var, torch.float32
+    )
+
+
+@_impl_if_enabled(
+    lib, "batch_norm_native_f32", "CompositeExplicitAutograd", torch.float32
+)
+def batch_norm_native_f32_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    return _batch_norm_native_impl_float(
+        input, weight, bias, running_mean, running_var, eps, torch.float32
+    )
+
+
+@_register_fake_if_enabled("cortex_m::batch_norm_native_f16", torch.float16)
+def batch_norm_native_f16_meta(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del eps
+    return _batch_norm_native_meta_float(
+        input, weight, bias, running_mean, running_var, torch.float16
+    )
+
+
+@_impl_if_enabled(
+    lib, "batch_norm_native_f16", "CompositeExplicitAutograd", torch.float16
+)
+def batch_norm_native_f16_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    return _batch_norm_native_impl_float(
+        input, weight, bias, running_mean, running_var, eps, torch.float16
+    )
+
+
+def _svdf_meta_float(
+    input: torch.Tensor,
+    initial_state: torch.Tensor,
+    weights_feature: torch.Tensor,
+    weights_time: torch.Tensor,
+    bias: torch.Tensor,
+    time_major: bool,
+    rank: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    assert (
+        input.dtype == dtype
+    ), f"cortex_m.svdf: expected {dtype} input tensor, got {input.dtype}"
+    assert (
+        initial_state.dtype == dtype
+        and weights_feature.dtype == dtype
+        and weights_time.dtype == dtype
+        and bias.dtype == dtype
+    ), f"cortex_m.svdf: expected {dtype} state/weight/bias tensors"
+    assert input.dim() == 3, f"cortex_m.svdf: expected rank-3 input, got {input.dim()}"
+    assert (
+        initial_state.dim() == 3
+    ), f"cortex_m.svdf: expected rank-3 initial_state, got {initial_state.dim()}"
+    assert (
+        weights_feature.dim() == 2 and weights_time.dim() == 2
+    ), "cortex_m.svdf: weights_feature and weights_time must be rank-2"
+    assert bias.dim() == 1, f"cortex_m.svdf: expected rank-1 bias, got {bias.dim()}"
+
+    batch_size = input.shape[1] if time_major else input.shape[0]
+    input_size = input.shape[2]
+    feature_batches = weights_feature.shape[0]
+    memory_size = weights_time.shape[1]
+
+    assert (
+        weights_feature.shape[1] == input_size
+    ), "cortex_m.svdf: weights_feature second dimension must match input_size"
+    assert (
+        weights_time.shape[0] == feature_batches
+    ), "cortex_m.svdf: weights_time first dimension must match feature_batches"
+    assert initial_state.shape == (batch_size, feature_batches, memory_size), (
+        f"cortex_m.svdf: initial_state must have shape {(batch_size, feature_batches, memory_size)}, "
+        f"got {tuple(initial_state.shape)}"
+    )
+    assert (
+        rank > 0 and feature_batches % rank == 0
+    ), "cortex_m.svdf: feature_batches must be divisible by rank"
+    unit_count = feature_batches // rank
+    assert bias.shape == (
+        unit_count,
+    ), f"cortex_m.svdf: bias must have shape ({unit_count},), got {tuple(bias.shape)}"
+    return torch.empty((batch_size, unit_count), dtype=dtype, device=input.device)
+
+
+def _svdf_impl_float(
+    input: torch.Tensor,
+    initial_state: torch.Tensor,
+    weights_feature: torch.Tensor,
+    weights_time: torch.Tensor,
+    bias: torch.Tensor,
+    time_major: bool,
+    rank: int,
+    input_activation_min: float,
+    input_activation_max: float,
+    output_activation_min: float,
+    output_activation_max: float,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    out = _svdf_meta_float(
+        input,
+        initial_state,
+        weights_feature,
+        weights_time,
+        bias,
+        time_major,
+        rank,
+        dtype,
+    )
+    sequence = input if time_major else input.transpose(0, 1)
+    state = initial_state.clone()
+    unit_count = bias.shape[0]
+    output = out
+    for step in range(sequence.shape[0]):
+        x_t = sequence[step]
+        projected = torch.clamp(
+            x_t @ weights_feature.transpose(0, 1),
+            min=input_activation_min,
+            max=input_activation_max,
+        )
+        state = torch.roll(state, shifts=-1, dims=2)
+        state[:, :, -1] = projected
+        out_a = torch.sum(state * weights_time.unsqueeze(0), dim=2)
+        out_b = out_a.reshape(x_t.shape[0], unit_count, rank).sum(dim=2) + bias
+        output = torch.clamp(
+            out_b, min=output_activation_min, max=output_activation_max
+        )
+    return output
+
+
+@_register_fake_if_enabled("cortex_m::svdf_f32", torch.float32)
+def svdf_f32_meta(
+    input: torch.Tensor,
+    initial_state: torch.Tensor,
+    weights_feature: torch.Tensor,
+    weights_time: torch.Tensor,
+    bias: torch.Tensor,
+    time_major: bool,
+    rank: int,
+    input_activation_min: float,
+    input_activation_max: float,
+    output_activation_min: float,
+    output_activation_max: float,
+) -> torch.Tensor:
+    del (
+        input_activation_min,
+        input_activation_max,
+        output_activation_min,
+        output_activation_max,
+    )
+    return _svdf_meta_float(
+        input,
+        initial_state,
+        weights_feature,
+        weights_time,
+        bias,
+        time_major,
+        rank,
+        torch.float32,
+    )
+
+
+@_impl_if_enabled(lib, "svdf_f32", "CompositeExplicitAutograd", torch.float32)
+def svdf_f32_impl(
+    input: torch.Tensor,
+    initial_state: torch.Tensor,
+    weights_feature: torch.Tensor,
+    weights_time: torch.Tensor,
+    bias: torch.Tensor,
+    time_major: bool,
+    rank: int,
+    input_activation_min: float,
+    input_activation_max: float,
+    output_activation_min: float,
+    output_activation_max: float,
+) -> torch.Tensor:
+    return _svdf_impl_float(
+        input,
+        initial_state,
+        weights_feature,
+        weights_time,
+        bias,
+        time_major,
+        rank,
+        input_activation_min,
+        input_activation_max,
+        output_activation_min,
+        output_activation_max,
+        torch.float32,
+    )
+
+
+@_register_fake_if_enabled("cortex_m::svdf_f16", torch.float16)
+def svdf_f16_meta(
+    input: torch.Tensor,
+    initial_state: torch.Tensor,
+    weights_feature: torch.Tensor,
+    weights_time: torch.Tensor,
+    bias: torch.Tensor,
+    time_major: bool,
+    rank: int,
+    input_activation_min: float,
+    input_activation_max: float,
+    output_activation_min: float,
+    output_activation_max: float,
+) -> torch.Tensor:
+    del (
+        input_activation_min,
+        input_activation_max,
+        output_activation_min,
+        output_activation_max,
+    )
+    return _svdf_meta_float(
+        input,
+        initial_state,
+        weights_feature,
+        weights_time,
+        bias,
+        time_major,
+        rank,
+        torch.float16,
+    )
+
+
+@_impl_if_enabled(lib, "svdf_f16", "CompositeExplicitAutograd", torch.float16)
+def svdf_f16_impl(
+    input: torch.Tensor,
+    initial_state: torch.Tensor,
+    weights_feature: torch.Tensor,
+    weights_time: torch.Tensor,
+    bias: torch.Tensor,
+    time_major: bool,
+    rank: int,
+    input_activation_min: float,
+    input_activation_max: float,
+    output_activation_min: float,
+    output_activation_max: float,
+) -> torch.Tensor:
+    return _svdf_impl_float(
+        input,
+        initial_state,
+        weights_feature,
+        weights_time,
+        bias,
+        time_major,
+        rank,
+        input_activation_min,
+        input_activation_max,
+        output_activation_min,
+        output_activation_max,
+        torch.float16,
+    )
+
+
+# ===================================================================
+# TRANSPOSE OPERATION DEFINITION
+# ===================================================================
+lib.define(
+    "pad_f32(Tensor input, int[] pre_pad, int[] post_pad, float pad_value) -> Tensor"
+)
+lib.define(
+    "pad_f32.out(Tensor input, int[] pre_pad, int[] post_pad, float pad_value, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+lib.define(
+    "pad_f16(Tensor input, int[] pre_pad, int[] post_pad, float pad_value) -> Tensor"
+)
+lib.define(
+    "pad_f16.out(Tensor input, int[] pre_pad, int[] post_pad, float pad_value, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+
+
+def _pad_meta_float(
+    input: torch.Tensor,
+    pre_pad: list[int],
+    post_pad: list[int],
+) -> torch.Tensor:
+    rank = input.dim()
+    offset = 4 - rank
+    logical_pre = _pad_to_logical_order(pre_pad, input)
+    logical_post = _pad_to_logical_order(post_pad, input)
+
+    output_shape = list(input.shape)
+    for i in range(rank):
+        output_shape[i] += logical_pre[offset + i] + logical_post[offset + i]
+    result = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+    if is_channels_last(input):
+        result = result.to(memory_format=torch.channels_last)
+    return result
+
+
+def _pad_impl_float(
+    input: torch.Tensor,
+    pre_pad: list[int],
+    post_pad: list[int],
+    pad_value: float,
+) -> torch.Tensor:
+    rank = input.dim()
+    offset = 4 - rank
+    logical_pre = _pad_to_logical_order(pre_pad, input)
+    logical_post = _pad_to_logical_order(post_pad, input)
+
+    padding = []
+    for i in reversed(range(rank)):
+        padding.extend([logical_pre[offset + i], logical_post[offset + i]])
+    return F.pad(input, padding, mode="constant", value=float(pad_value))
+
+
+@_register_fake_if_enabled("cortex_m::pad_f32", torch.float32)
+def pad_f32_meta(
+    input: torch.Tensor,
+    pre_pad: list[int],
+    post_pad: list[int],
+    pad_value: float,
+) -> torch.Tensor:
+    del pad_value
+    return _pad_meta_float(input, pre_pad, post_pad)
+
+
+@_impl_if_enabled(lib, "pad_f32", "CompositeExplicitAutograd", torch.float32)
+def pad_f32_impl(
+    input: torch.Tensor,
+    pre_pad: list[int],
+    post_pad: list[int],
+    pad_value: float,
+) -> torch.Tensor:
+    if input.dtype != torch.float32:
+        raise TypeError(
+            f"cortex_m.pad_f32: expected float32 input tensor, got {input.dtype}"
+        )
+    return _pad_impl_float(input, pre_pad, post_pad, pad_value)
+
+
+@_register_fake_if_enabled("cortex_m::pad_f16", torch.float16)
+def pad_f16_meta(
+    input: torch.Tensor,
+    pre_pad: list[int],
+    post_pad: list[int],
+    pad_value: float,
+) -> torch.Tensor:
+    del pad_value
+    return _pad_meta_float(input, pre_pad, post_pad)
+
+
+@_impl_if_enabled(lib, "pad_f16", "CompositeExplicitAutograd", torch.float16)
+def pad_f16_impl(
+    input: torch.Tensor,
+    pre_pad: list[int],
+    post_pad: list[int],
+    pad_value: float,
+) -> torch.Tensor:
+    if input.dtype != torch.float16:
+        raise TypeError(
+            f"cortex_m.pad_f16: expected float16 input tensor, got {input.dtype}"
+        )
+    return _pad_impl_float(input, pre_pad, post_pad, pad_value)
+
+
+# ===================================================================
+# FLOAT / QUANTIZED CONV2D OPERATION DEFINITION
+# ===================================================================
+# Packed float conv weights follow the same idea as packed linear/BMM weights:
+# the tensor becomes a flat kernel buffer and the original [O, KH, KW, I]
+# shape is carried explicitly through packed_* metadata.
+
+lib.define(
+    "conv2d_f32("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] dilation, "
+    "bool weight_is_packed, "
+    "int packed_output_channels, "
+    "int packed_kernel_height, "
+    "int packed_kernel_width, "
+    "int packed_kernel_input_channels, "
+    "float activation_min, "
+    "float activation_max"
+    ") -> Tensor"
+)
+lib.define(
+    "conv2d_f32.out("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] dilation, "
+    "bool weight_is_packed, "
+    "int packed_output_channels, "
+    "int packed_kernel_height, "
+    "int packed_kernel_width, "
+    "int packed_kernel_input_channels, "
+    "float activation_min, "
+    "float activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+lib.define(
+    "conv2d_f16("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] dilation, "
+    "bool weight_is_packed, "
+    "int packed_output_channels, "
+    "int packed_kernel_height, "
+    "int packed_kernel_width, "
+    "int packed_kernel_input_channels, "
+    "float activation_min, "
+    "float activation_max"
+    ") -> Tensor"
+)
+lib.define(
+    "conv2d_f16.out("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] dilation, "
+    "bool weight_is_packed, "
+    "int packed_output_channels, "
+    "int packed_kernel_height, "
+    "int packed_kernel_width, "
+    "int packed_kernel_input_channels, "
+    "float activation_min, "
+    "float activation_max, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+def _float_conv2d_meta_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    weight_is_packed: bool,
+    packed_output_channels: int,
+    packed_kernel_height: int,
+    packed_kernel_width: int,
+    packed_kernel_input_channels: int,
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    assert (
+        input.dtype == expected_dtype
+    ), f"Cortex-M float conv expects input dtype={expected_dtype}, got {input.dtype}"
+    assert (
+        weight.dtype == expected_dtype
+    ), f"Cortex-M float conv expects weight dtype={expected_dtype}, got {weight.dtype}"
+    assert input.dim() == 4, "Cortex-M float conv expects 4D input tensors"
+    if weight_is_packed:
+        # Packed conv constants are stored as a flat buffer. The original
+        # [O, KH, KW, I] shape is reconstructed from the packed_* metadata.
+        assert (
+            weight.dim() == 1
+        ), "Cortex-M float conv expects rank-1 packed weights when weight_is_packed=True"
+        assert (
+            packed_output_channels > 0
+        ), "Cortex-M float conv expects packed_output_channels > 0 when weight_is_packed=True"
+        assert (
+            packed_kernel_height > 0
+            and packed_kernel_width > 0
+            and packed_kernel_input_channels > 0
+        ), (
+            "Cortex-M float conv expects packed kernel shape metadata when "
+            "weight_is_packed=True"
+        )
+    else:
+        assert (
+            weight.dim() == 4
+        ), "Cortex-M float conv expects 4D weight tensors when unpacked"
+    assert (
+        len(stride) == 2 and len(padding) == 2 and len(dilation) == 2
+    ), "Cortex-M float conv expects stride/padding/dilation length == 2"
+    assert is_channels_last(input), "Cortex-M float conv expects channels-last input"
+    if bias is not None:
+        assert (
+            bias.dtype == expected_dtype and bias.dim() == 1
+        ), "Cortex-M float conv expects optional bias with shape [out_channels]"
+        expected_out_channels = (
+            packed_output_channels if weight_is_packed else weight.shape[0]
+        )
+        assert (
+            bias.shape[0] == expected_out_channels
+        ), f"Cortex-M float conv bias size mismatch: {bias.shape[0]} vs {expected_out_channels}"
+
+    if weight_is_packed:
+        output_shape = _compute_conv2d_output_shape(
+            input.shape,
+            torch.Size(
+                [
+                    packed_output_channels,
+                    packed_kernel_height,
+                    packed_kernel_width,
+                    packed_kernel_input_channels,
+                ]
+            ),
+            list(stride),
+            list(padding),
+            list(dilation),
+        )
+    else:
+        output_shape = _compute_conv2d_output_shape(
+            input.shape, weight.shape, list(stride), list(padding), list(dilation)
+        )
+    return torch.empty(
+        output_shape,
+        dtype=expected_dtype,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+def _float_conv2d_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    weight_is_packed: bool,
+    packed_output_channels: int,
+    packed_kernel_height: int,
+    packed_kernel_width: int,
+    packed_kernel_input_channels: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    _float_conv2d_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        weight_is_packed,
+        packed_output_channels,
+        packed_kernel_height,
+        packed_kernel_width,
+        packed_kernel_input_channels,
+        input.dtype,
+    )
+    if weight_is_packed:
+        # Reconstruct a standard 4D kernel for the Python reference path so the
+        # eager fallback stays numerically comparable to the backend execution.
+        block_cols = 8 if input.dtype == torch.float16 else 4
+        flat_features = (
+            packed_kernel_height * packed_kernel_width * packed_kernel_input_channels
+        )
+        packed_blocks = (packed_output_channels + block_cols - 1) // block_cols
+        expected_numel = packed_blocks * flat_features * block_cols
+        assert weight.numel() == expected_numel, (
+            "Packed Cortex-M float conv weight size mismatch: "
+            f"{weight.numel()} vs {expected_numel}"
+        )
+        packed_3d = weight.reshape(packed_blocks, flat_features, block_cols)
+        unpacked = torch.zeros(
+            (packed_output_channels, flat_features),
+            dtype=input.dtype,
+            device=input.device,
+        )
+        for out_channel in range(packed_output_channels):
+            block = out_channel // block_cols
+            lane = out_channel % block_cols
+            unpacked[out_channel].copy_(packed_3d[block, :, lane])
+        weight = unpacked.reshape(
+            packed_output_channels,
+            packed_kernel_height,
+            packed_kernel_width,
+            packed_kernel_input_channels,
+        )
+    weight_oihw = weight.permute(0, 3, 1, 2).contiguous()
+    result = F.conv2d(
+        input,
+        weight_oihw,
+        bias,
+        stride=tuple(stride),
+        padding=tuple(padding),
+        dilation=tuple(dilation),
+        groups=1,
+    )
+    result = torch.clamp(result, min=activation_min, max=activation_max)
+    return result.contiguous(memory_format=torch.channels_last)
+
+
+def _float_depthwise_conv2d_meta_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    depth_multiplier: int,
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    assert (
+        input.dtype == expected_dtype
+    ), f"Cortex-M float depthwise conv expects input dtype={expected_dtype}, got {input.dtype}"
+    assert (
+        weight.dtype == expected_dtype
+    ), f"Cortex-M float depthwise conv expects weight dtype={expected_dtype}, got {weight.dtype}"
+    assert (
+        input.dim() == 4 and weight.dim() == 4
+    ), "Cortex-M float depthwise conv expects 4D input and weight tensors"
+    assert (
+        len(stride) == 2 and len(padding) == 2 and len(dilation) == 2
+    ), "Cortex-M float depthwise conv expects stride/padding/dilation length == 2"
+    assert is_channels_last(
+        input
+    ), "Cortex-M float depthwise conv expects channels-last input"
+    assert (
+        weight.shape[0] == 1
+    ), f"Cortex-M float depthwise conv expects IHWO weights with dim0==1, got {weight.shape[0]}"
+    in_channels = input.shape[1]
+    out_channels = weight.shape[3]
+    assert out_channels == in_channels * depth_multiplier, (
+        "Cortex-M float depthwise conv expects out_channels == in_channels * depth_multiplier, "
+        f"got out_channels={out_channels}, in_channels={in_channels}, depth_multiplier={depth_multiplier}"
+    )
+    if bias is not None:
+        assert (
+            bias.dtype == expected_dtype and bias.dim() == 1
+        ), "Cortex-M float depthwise conv expects optional bias with shape [out_channels]"
+        assert (
+            bias.shape[0] == out_channels
+        ), f"Cortex-M float depthwise conv bias size mismatch: {bias.shape[0]} vs {out_channels}"
+
+    output_shape = _compute_depthwise_conv2d_output_shape(
+        input.shape, weight.shape, list(stride), list(padding), list(dilation)
+    )
+    return torch.empty(
+        output_shape,
+        dtype=expected_dtype,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+def _float_depthwise_conv2d_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    depth_multiplier: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del depth_multiplier
+    weight_oihw = weight.permute(3, 0, 1, 2).contiguous()
+    result = F.conv2d(
+        input,
+        weight_oihw,
+        bias,
+        stride=tuple(stride),
+        padding=tuple(padding),
+        dilation=tuple(dilation),
+        groups=input.shape[1],
+    )
+    result = torch.clamp(result, min=activation_min, max=activation_max)
+    return result.contiguous(memory_format=torch.channels_last)
+
+
+@_register_fake_if_enabled("cortex_m::conv2d_f32", torch.float32)
+def conv2d_f32_meta(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    weight_is_packed: bool,
+    packed_output_channels: int,
+    packed_kernel_height: int,
+    packed_kernel_width: int,
+    packed_kernel_input_channels: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del activation_min, activation_max
+    return _float_conv2d_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        weight_is_packed,
+        packed_output_channels,
+        packed_kernel_height,
+        packed_kernel_width,
+        packed_kernel_input_channels,
+        torch.float32,
+    )
+
+
+@_impl_if_enabled(lib, "conv2d_f32", "CompositeExplicitAutograd", torch.float32)
+def conv2d_f32_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    weight_is_packed: bool,
+    packed_output_channels: int,
+    packed_kernel_height: int,
+    packed_kernel_width: int,
+    packed_kernel_input_channels: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _float_conv2d_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        weight_is_packed,
+        packed_output_channels,
+        packed_kernel_height,
+        packed_kernel_width,
+        packed_kernel_input_channels,
+        activation_min,
+        activation_max,
+    )
+
+
+@_register_fake_if_enabled("cortex_m::conv2d_f16", torch.float16)
+def conv2d_f16_meta(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    weight_is_packed: bool,
+    packed_output_channels: int,
+    packed_kernel_height: int,
+    packed_kernel_width: int,
+    packed_kernel_input_channels: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del activation_min, activation_max
+    return _float_conv2d_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        weight_is_packed,
+        packed_output_channels,
+        packed_kernel_height,
+        packed_kernel_width,
+        packed_kernel_input_channels,
+        torch.float16,
+    )
+
+
+@_impl_if_enabled(lib, "conv2d_f16", "CompositeExplicitAutograd", torch.float16)
+def conv2d_f16_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    weight_is_packed: bool,
+    packed_output_channels: int,
+    packed_kernel_height: int,
+    packed_kernel_width: int,
+    packed_kernel_input_channels: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _float_conv2d_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        weight_is_packed,
+        packed_output_channels,
+        packed_kernel_height,
+        packed_kernel_width,
+        packed_kernel_input_channels,
+        activation_min,
+        activation_max,
+    )
+
+
+@_register_fake_if_enabled("cortex_m::depthwise_conv2d_f32", torch.float32)
+def depthwise_conv2d_f32_meta(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    depth_multiplier: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del activation_min, activation_max
+    return _float_depthwise_conv2d_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        depth_multiplier,
+        torch.float32,
+    )
+
+
+@_impl_if_enabled(
+    lib, "depthwise_conv2d_f32", "CompositeExplicitAutograd", torch.float32
+)
+def depthwise_conv2d_f32_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    depth_multiplier: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _float_depthwise_conv2d_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        depth_multiplier,
+        activation_min,
+        activation_max,
+    )
+
+
+@_register_fake_if_enabled("cortex_m::depthwise_conv2d_f16", torch.float16)
+def depthwise_conv2d_f16_meta(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    depth_multiplier: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del activation_min, activation_max
+    return _float_depthwise_conv2d_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        depth_multiplier,
+        torch.float16,
+    )
+
+
+@_impl_if_enabled(
+    lib, "depthwise_conv2d_f16", "CompositeExplicitAutograd", torch.float16
+)
+def depthwise_conv2d_f16_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    depth_multiplier: int,
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _float_depthwise_conv2d_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        depth_multiplier,
+        activation_min,
+        activation_max,
+    )
+
+
+lib.define(
+    "transpose_conv2d_f32("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] output_padding, "
+    "int[] dilation, "
+    "float activation_min, "
+    "float activation_max"
+    ") -> Tensor"
+)
+
+lib.define(
+    "transpose_conv2d_f32.out("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] output_padding, "
+    "int[] dilation, "
+    "float activation_min, "
+    "float activation_max, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+
+lib.define(
+    "transpose_conv2d_f16("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] output_padding, "
+    "int[] dilation, "
+    "float activation_min, "
+    "float activation_max"
+    ") -> Tensor"
+)
+
+lib.define(
+    "transpose_conv2d_f16.out("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] output_padding, "
+    "int[] dilation, "
+    "float activation_min, "
+    "float activation_max, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+
+
+def _transpose_conv2d_float_meta_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    assert (
+        input.dtype == expected_dtype
+    ), f"Cortex-M float transpose_conv2d expects input dtype={expected_dtype}, got {input.dtype}"
+    assert (
+        weight.dtype == expected_dtype
+    ), f"Cortex-M float transpose_conv2d expects weight dtype={expected_dtype}, got {weight.dtype}"
+    assert input.dim() == 4 and weight.dim() == 4, (
+        "Cortex-M float transpose_conv2d expects 4D input and weight tensors, "
+        f"got input.dim()={input.dim()}, weight.dim()={weight.dim()}"
+    )
+    assert is_channels_last(
+        input
+    ), "Cortex-M float transpose_conv2d expects channels-last input"
+    if bias is not None:
+        assert (
+            bias.dtype == expected_dtype
+        ), f"Cortex-M float transpose_conv2d expects bias dtype={expected_dtype}, got {bias.dtype}"
+        assert bias.dim() == 1 and bias.shape[0] == weight.shape[0], (
+            "Cortex-M float transpose_conv2d expects bias shape [out_channels], "
+            f"got bias.shape={tuple(bias.shape)}, out_channels={weight.shape[0]}"
+        )
+
+    output_shape = _compute_conv_transpose2d_output_shape(
+        input.shape,
+        weight.shape,
+        list(stride),
+        list(padding),
+        list(output_padding),
+        list(dilation),
+    )
+
+    return torch.empty(
+        output_shape,
+        dtype=expected_dtype,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+def _transpose_conv2d_float_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    activation_min: float,
+    activation_max: float,
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    _transpose_conv2d_float_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        expected_dtype,
+    )
+
+    weight_iohw = weight.permute(3, 0, 1, 2).contiguous()
+    result = F.conv_transpose2d(
+        input,
+        weight_iohw,
+        bias,
+        stride=_ensure_tuple2(stride),
+        padding=_ensure_tuple2(padding),
+        output_padding=_ensure_tuple2(output_padding),
+        dilation=_ensure_tuple2(dilation),
+        groups=1,
+    )
+    result = torch.clamp(result, min=activation_min, max=activation_max)
+    return result.contiguous(memory_format=torch.channels_last)
+
+
+@_register_fake_if_enabled("cortex_m::transpose_conv2d_f32", torch.float32)
+def transpose_conv2d_f32_meta(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del activation_min, activation_max
+    return _transpose_conv2d_float_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        torch.float32,
+    )
+
+
+@_impl_if_enabled(
+    lib, "transpose_conv2d_f32", "CompositeExplicitAutograd", torch.float32
+)
+def transpose_conv2d_f32_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _transpose_conv2d_float_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        activation_min,
+        activation_max,
+        torch.float32,
+    )
+
+
+@_register_fake_if_enabled("cortex_m::transpose_conv2d_f16", torch.float16)
+def transpose_conv2d_f16_meta(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del activation_min, activation_max
+    return _transpose_conv2d_float_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        torch.float16,
+    )
+
+
+@_impl_if_enabled(
+    lib, "transpose_conv2d_f16", "CompositeExplicitAutograd", torch.float16
+)
+def transpose_conv2d_f16_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _transpose_conv2d_float_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        activation_min,
+        activation_max,
+        torch.float16,
+    )
+
+
+# ===================================================================
+# QUANTIZED AVG_POOL2D OPERATION DEFINITION
+# ===================================================================
+
+lib.define(
+    "avg_pool2d_f32("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding"
+    ") -> Tensor"
+)
+lib.define(
+    "avg_pool2d_f32.out("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+
+
+@_register_fake_if_enabled("cortex_m::avg_pool2d_f32", torch.float32)
+def avg_pool2d_f32_meta(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    assert (
+        input.dtype == torch.float32
+    ), f"Cortex-M avg_pool2d_f32 expects float32 inputs, got {input.dtype}"
+    output = F.avg_pool2d(
+        input,
+        _ensure_tuple2(kernel_size),
+        stride=_ensure_tuple2(stride),
+        padding=_ensure_tuple2(padding),
+        ceil_mode=False,
+        count_include_pad=False,
+    )
+    return torch.empty_like(output)
+
+
+@_impl_if_enabled(lib, "avg_pool2d_f32", "CompositeExplicitAutograd", torch.float32)
+def avg_pool2d_f32_impl(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    assert (
+        input.dtype == torch.float32
+    ), f"Cortex-M avg_pool2d_f32 expects float32 inputs, got {input.dtype}"
+    return F.avg_pool2d(
+        input,
+        _ensure_tuple2(kernel_size),
+        stride=_ensure_tuple2(stride),
+        padding=_ensure_tuple2(padding),
+        ceil_mode=False,
+        count_include_pad=False,
+    )
+
+
+lib.define(
+    "avg_pool2d_f16("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding"
+    ") -> Tensor"
+)
+lib.define(
+    "avg_pool2d_f16.out("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+
+
+@_register_fake_if_enabled("cortex_m::avg_pool2d_f16", torch.float16)
+def avg_pool2d_f16_meta(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    assert (
+        input.dtype == torch.float16
+    ), f"Cortex-M avg_pool2d_f16 expects float16 inputs, got {input.dtype}"
+    output = F.avg_pool2d(
+        input,
+        _ensure_tuple2(kernel_size),
+        stride=_ensure_tuple2(stride),
+        padding=_ensure_tuple2(padding),
+        ceil_mode=False,
+        count_include_pad=False,
+    )
+    return torch.empty_like(output)
+
+
+@_impl_if_enabled(lib, "avg_pool2d_f16", "CompositeExplicitAutograd", torch.float16)
+def avg_pool2d_f16_impl(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    assert (
+        input.dtype == torch.float16
+    ), f"Cortex-M avg_pool2d_f16 expects float16 inputs, got {input.dtype}"
+    return F.avg_pool2d(
+        input,
+        _ensure_tuple2(kernel_size),
+        stride=_ensure_tuple2(stride),
+        padding=_ensure_tuple2(padding),
+        ceil_mode=False,
+        count_include_pad=False,
+    )
+
+
+lib.define(
+    "max_pool2d_f32("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding"
+    ") -> Tensor"
+)
+
+lib.define(
+    "max_pool2d_f32.out("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@_register_fake_if_enabled("cortex_m::max_pool2d_f32", torch.float32)
+def max_pool2d_f32_meta(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    if input.dtype != torch.float32:
+        raise RuntimeError(
+            f"Cortex-M max_pool2d_f32 expects float32 inputs, got {input.dtype}"
+        )
+
+    kernel = _ensure_tuple2(kernel_size)
+    stride_vals = _ensure_tuple2(stride)
+    padding_vals = _ensure_tuple2(padding)
+    output_shape = _compute_max_pool2d_output_shape(
+        input.shape, kernel, stride_vals, padding_vals, (1, 1)
+    )
+    return torch.empty(
+        output_shape,
+        dtype=torch.float32,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+@_impl_if_enabled(lib, "max_pool2d_f32", "CompositeExplicitAutograd", torch.float32)
+def max_pool2d_f32_impl(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    if input.dtype != torch.float32:
+        raise RuntimeError(
+            f"Cortex-M max_pool2d_f32 expects float32 inputs, got {input.dtype}"
+        )
+
+    kernel = _ensure_tuple2(kernel_size)
+    stride_vals = _ensure_tuple2(stride)
+    padding_vals = _ensure_tuple2(padding)
+    return F.max_pool2d(
+        input,
+        kernel,
+        stride=stride_vals,
+        padding=padding_vals,
+        dilation=(1, 1),
+        ceil_mode=False,
+    ).contiguous(memory_format=torch.channels_last)
+
+
+lib.define(
+    "max_pool2d_f16("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding"
+    ") -> Tensor"
+)
+
+lib.define(
+    "max_pool2d_f16.out("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@_register_fake_if_enabled("cortex_m::max_pool2d_f16", torch.float16)
+def max_pool2d_f16_meta(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    if input.dtype != torch.float16:
+        raise RuntimeError(
+            f"Cortex-M max_pool2d_f16 expects float16 inputs, got {input.dtype}"
+        )
+
+    kernel = _ensure_tuple2(kernel_size)
+    stride_vals = _ensure_tuple2(stride)
+    padding_vals = _ensure_tuple2(padding)
+    output_shape = _compute_max_pool2d_output_shape(
+        input.shape, kernel, stride_vals, padding_vals, (1, 1)
+    )
+    return torch.empty(
+        output_shape,
+        dtype=torch.float16,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+@_impl_if_enabled(lib, "max_pool2d_f16", "CompositeExplicitAutograd", torch.float16)
+def max_pool2d_f16_impl(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    if input.dtype != torch.float16:
+        raise RuntimeError(
+            f"Cortex-M max_pool2d_f16 expects float16 inputs, got {input.dtype}"
+        )
+
+    kernel = _ensure_tuple2(kernel_size)
+    stride_vals = _ensure_tuple2(stride)
+    padding_vals = _ensure_tuple2(padding)
+    return F.max_pool2d(
+        input,
+        kernel,
+        stride=stride_vals,
+        padding=padding_vals,
+        dilation=(1, 1),
+        ceil_mode=False,
+    ).contiguous(memory_format=torch.channels_last)
+
+
+@register_fake("cortex_m::quantized_max_pool2d")  # type: ignore[misc]
 @impl(lib, "quantized_conv2d_nhwc", "CompositeExplicitAutograd")  # type: ignore[misc]
 def quantized_conv2d_nhwc_impl(
     input: torch.Tensor,

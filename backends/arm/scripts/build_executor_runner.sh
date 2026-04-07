@@ -33,6 +33,7 @@ output_folder="."
 et_build_root="${et_root_dir}/arm_test"
 ethosu_tools_dir=${et_root_dir}/examples/arm/arm-scratch
 select_ops_list=""
+cmsis_nn_local_path=""
 
 build_bundleio_flags=" -DET_BUNDLE_IO=OFF "
 build_with_etdump_flags=" -DEXECUTORCH_ENABLE_EVENT_TRACER=OFF "
@@ -68,7 +69,8 @@ help() {
     echo "  --output=<FOLDER>                    Output folder Default: <MODEL>/<MODEL>_<TARGET INFO>.pte"
     echo "  --et_build_root=<FOLDER>             Build output root folder to use, defaults to ${et_build_root}"
     echo "  --ethosu_tools_dir=<FOLDER>          Path to your Ethos-U tools dir if you not using default: ${ethosu_tools_dir}"
-    echo "  --toolchain=<TOOLCHAIN>              Toolchain can be specified (arm-none-eabi-gcc, arm-zephyr-eabi-gcc). Default: ${toolchain}"
+    echo "  --toolchain=<TOOLCHAIN>              Toolchain can be specified (arm-none-eabi-gcc, armclang, clang, arm-zephyr-eabi-gcc). Default: ${toolchain}"
+    echo "  --cmsis_nn_local_path=<PATH>         Use a local CMSIS-NN checkout instead of the arm-scratch copy."
     echo "  --select_ops_list=<OPS>              Comma separated list of portable (non-delegated) kernels to include Default: ${select_ops_list}"
     echo "                                         NOTE: This is used when select_ops_model is not possible to use, e.g. for semihosting or bundleio."
     echo "                                         See https://docs.pytorch.org/executorch/stable/kernel-library-selective-build.html for more information."
@@ -90,6 +92,7 @@ for arg in "$@"; do
         --et_build_root=*) et_build_root="${arg#*=}";;
         --ethosu_tools_dir=*) ethosu_tools_dir="${arg#*=}";;
         --toolchain=*) toolchain="${arg#*=}";;
+        --cmsis_nn_local_path=*) cmsis_nn_local_path="${arg#*=}";;
         --select_ops_list=*) select_ops_list="${arg#*=}";;
         *)
         ;;
@@ -97,6 +100,8 @@ for arg in "$@"; do
 done
 
 if [[ ${toolchain} == "arm-none-eabi-gcc" ]]; then
+    toolchain_cmake=${et_root_dir}/examples/arm/ethos-u-setup/${toolchain}.cmake
+elif [[ ${toolchain} == "armclang" || ${toolchain} == "clang" ]]; then
     toolchain_cmake=${et_root_dir}/examples/arm/ethos-u-setup/${toolchain}.cmake
 elif [[ ${toolchain} == "arm-zephyr-eabi-gcc" ]]; then
     toolchain_cmake=${et_root_dir}/examples/zephyr/x86_64-linux-arm-zephyr-eabi-gcc.cmake
@@ -107,7 +112,7 @@ elif [[ ${toolchain} == "aarch64-linux-musl-gcc" ]]; then
     exit 1;
 else
     echo "Error: Invalid toolchain selection, provided: ${toolchain}"
-    echo "    Valid options are {arm-none-eabi-gcc, arm-zephyr-eabi-gcc}"
+    echo "    Valid options are {arm-none-eabi-gcc, armclang, clang, arm-zephyr-eabi-gcc}"
     exit 1;
 fi
 toolchain_cmake=$(realpath ${toolchain_cmake})
@@ -118,6 +123,23 @@ toolchain_cmake=$(realpath ${toolchain_cmake})
     || { echo "Missing ${setup_path_script}. ${_setup_msg}"; exit 1; }
 
 source ${setup_path_script}
+
+if [[ ${toolchain} == "armclang" ]]; then
+    ac6_bin_dir="${AC6_TOOLCHAIN:-}"
+    if [[ ! -x "${ac6_bin_dir}/armclang" ]]; then
+        echo "Error: armclang not found in '${ac6_bin_dir}'."
+        echo "       Export AC6_TOOLCHAIN to a recent Arm Compiler 6 bin directory."
+        exit 1
+    fi
+    export PATH="${ac6_bin_dir}:${PATH}"
+elif [[ ${toolchain} == "clang" ]]; then
+    clang_bin_dir="${CLANG_TOOLCHAIN_ROOT:-}"
+    if [[ ! -x "${clang_bin_dir}/clang" ]]; then
+        echo "Error: clang not found in '${clang_bin_dir}'."
+        echo "       Export CLANG_TOOLCHAIN_ROOT to the LLVM/Clang bin directory."
+        exit 1
+    fi
+fi
 
 [[ -f ${preset_file} ]] \
     || { echo "Missing ${preset_file}. ${_setup_msg}"; exit 1; }
@@ -146,9 +168,10 @@ ethosu_tools_dir=$(realpath ${ethosu_tools_dir})
 ethos_u_root_dir="${ethosu_tools_dir}/ethos-u"
 mkdir -p "${ethos_u_root_dir}"
 ethos_u_root_dir=$(realpath ${ethos_u_root_dir})
-cmsis_nn_local_path=""
-if [[ -d "${ethos_u_root_dir}/core_software/cmsis-nn" ]]; then
+if [[ -z "${cmsis_nn_local_path}" && -d "${ethos_u_root_dir}/core_software/cmsis-nn" ]]; then
     cmsis_nn_local_path=$(realpath "${ethos_u_root_dir}/core_software/cmsis-nn")
+elif [[ -n "${cmsis_nn_local_path}" ]]; then
+    cmsis_nn_local_path=$(realpath "${cmsis_nn_local_path}")
 fi
 
 if [[ ${system_config} == "" ]]
@@ -233,6 +256,7 @@ cmake \
     -DEXECUTORCH_ROOT=${et_root_dir}           \
     -DCMAKE_BUILD_TYPE=${build_type}           \
     -DCMAKE_TOOLCHAIN_FILE=${toolchain_cmake}  \
+    $([[ ${toolchain} == "armclang" ]] && printf '%s' "-DCMAKE_POSITION_INDEPENDENT_CODE=OFF") \
     -DTARGET_CPU=${target_cpu}                 \
     -DETHOSU_TARGET_NPU_CONFIG=${npu_target_config} \
     -DEXECUTORCH_BUILD_PRESET_FILE=${preset_file} \
@@ -256,7 +280,20 @@ parallel_jobs="$(get_parallel_jobs)"
 cmake --build ${output_folder} -j"${parallel_jobs}" -- arm_executor_runner
 
 echo "[${BASH_SOURCE[0]}] Generated ${toolchain} elf file:"
-find ${output_folder} -name "arm_executor_runner"
-echo "executable_text: $(find ${output_folder} -name arm_executor_runner -exec ${toolchain/-gcc/-size} {} \; | grep -v filename | awk '{print $1}') bytes"
-echo "executable_data: $(find ${output_folder} -name arm_executor_runner -exec ${toolchain/-gcc/-size} {} \; | grep -v filename | awk '{print $2}') bytes"
-echo "executable_bss:  $(find ${output_folder} -name arm_executor_runner -exec ${toolchain/-gcc/-size} {} \; | grep -v filename | awk '{print $3}') bytes"
+find ${output_folder} -name "arm_executor_runner*" -type f
+if [[ ${toolchain} == "armclang" || ${toolchain} == "clang" ]]; then
+    size_tool="${CMAKE_SIZE:-llvm-size}"
+else
+    size_tool="$(command -v ${toolchain/-gcc/-size} || true)"
+fi
+
+if [[ -n "${size_tool}" ]] && command -v "${size_tool}" >/dev/null 2>&1; then
+    runner_binary=$(find ${output_folder} -name 'arm_executor_runner*' -type f -executable | head -1)
+    if [[ -n "${runner_binary}" ]]; then
+        echo "executable_text: $(${size_tool} "${runner_binary}" | grep -v filename | awk 'NR==1{print $1}') bytes"
+        echo "executable_data: $(${size_tool} "${runner_binary}" | grep -v filename | awk 'NR==1{print $2}') bytes"
+        echo "executable_bss:  $(${size_tool} "${runner_binary}" | grep -v filename | awk 'NR==1{print $3}') bytes"
+    fi
+else
+    echo "Executable size summary skipped: no compatible size tool found."
+fi

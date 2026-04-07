@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import argparse
+from pathlib import Path
+
+import torch
+
+import executorch.backends.cortex_m.ops.operators  # noqa: F401
+from executorch.backends.cortex_m.passes.cortex_m_pass_manager import CortexMPassManager
+from executorch.exir import EdgeCompileConfig
+from executorch.extension.export_util.utils import export_to_edge, save_pte_program
+
+
+def ramp_tensor(start: float, end: float, shape: tuple[int, ...]) -> torch.Tensor:
+    return torch.linspace(
+        start,
+        end,
+        steps=int(torch.tensor(shape).prod()),
+        dtype=torch.float32,
+    ).reshape(shape)
+
+
+class ConvTranspose2DFloatDemo(torch.nn.Module):
+    def __init__(self, dtype: torch.dtype, *args, bias: bool = False, **kwargs):
+        super().__init__()
+        self.conv_transpose = torch.nn.ConvTranspose2d(*args, bias=bias, **kwargs)
+        with torch.no_grad():
+            self.conv_transpose.weight.copy_(
+                torch.linspace(
+                    -1.0,
+                    1.0,
+                    steps=self.conv_transpose.weight.numel(),
+                    dtype=torch.float32,
+                ).reshape_as(self.conv_transpose.weight)
+            )
+            if bias:
+                self.conv_transpose.bias.copy_(
+                    torch.linspace(
+                        -0.25,
+                        0.25,
+                        steps=self.conv_transpose.bias.numel(),
+                        dtype=torch.float32,
+                    )
+                )
+        self.conv_transpose = self.conv_transpose.to(dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv_transpose(x)
+
+
+def build_variant(variant: str, dtype: torch.dtype):
+    if variant == "basic":
+        model = ConvTranspose2DFloatDemo(dtype, 2, 4, 3).eval()
+        example_inputs = (
+            ramp_tensor(1, 5, (1, 2, 5, 5))
+            .to(dtype)
+            .contiguous(memory_format=torch.channels_last),
+        )
+        pte_base = "conv_transpose_basic"
+    elif variant == "bias":
+        model = ConvTranspose2DFloatDemo(dtype, 4, 8, kernel_size=3, bias=True).eval()
+        example_inputs = (
+            ramp_tensor(-20, 20, (1, 4, 6, 6))
+            .to(dtype)
+            .contiguous(memory_format=torch.channels_last),
+        )
+        pte_base = "conv_transpose_bias"
+    else:
+        raise ValueError(f"Unsupported variant: {variant}")
+    return model, example_inputs, pte_base
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-o", "--output_dir", default=".")
+    parser.add_argument("--dtype", choices=("float32", "float16"), default="float16")
+    parser.add_argument("--variant", choices=("basic", "bias"), default="basic")
+    args = parser.parse_args()
+
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    dtype = torch.float32 if args.dtype == "float32" else torch.float16
+    model, example_inputs, pte_base = build_variant(args.variant, dtype)
+
+    edge_program = export_to_edge(
+        model,
+        example_inputs,
+        edge_compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    )
+    edge_program._edge_programs["forward"] = CortexMPassManager(
+        edge_program.exported_program()
+    ).transform()
+    program = edge_program.to_executorch()
+
+    suffix = "f32" if dtype == torch.float32 else "f16"
+    save_pte_program(program, f"{pte_base}_{suffix}_demo", args.output_dir)
+
+
+if __name__ == "__main__":
+    with torch.no_grad():
+        main()

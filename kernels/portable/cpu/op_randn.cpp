@@ -24,7 +24,14 @@ Tensor&
 randn_out(KernelRuntimeContext& ctx, const IntArrayRef sizes, Tensor& out) {
   (void)ctx;
 
-  std::mt19937 gen((std::random_device())());
+  // Some bare-metal libc++ configurations expose <random> but explicitly
+  // disable std::random_device. Fall back to the deterministic mt19937 default
+  // seed when that capability is unavailable.
+  uint32_t seed = 5489u;
+#if !defined(_LIBCPP_HAS_RANDOM_DEVICE) || _LIBCPP_HAS_RANDOM_DEVICE
+  seed = (std::random_device())();
+#endif
+  std::mt19937 gen(seed);
   std::normal_distribution<double> dist(0.0, 1.0);
 
   // Resize for dynamic shape

@@ -30,6 +30,9 @@ build_with_etdump=OFF
 is_linux_musl=0
 extra_cmake_args=()
 target_cpu=""
+cmsis_nn_local_path=""
+cmsis_nn_enable_f32=OFF
+cmsis_nn_enable_f16=OFF
 
 help() {
     echo "Usage: $(basename $0) [options]"
@@ -40,7 +43,10 @@ help() {
     echo "  --devtools                Build Devtools libs"
     echo "  --etdump                  Adds Devtools etdump support to track timing, etdump area will be base64 encoded in the log"
     echo "  --cmake-args=<ARGS>       Additional arguments passed to cmake configure"
-    echo "  --toolchain=<TOOLCHAIN>   Toolchain can be specified (arm-none-eabi-gcc, arm-zephyr-eabi-gcc, aarch64-linux-musl-gcc). Default: ${toolchain}"
+    echo "  --cmsis_nn_local_path=<PATH> Use a local CMSIS-NN checkout instead of FetchContent."
+    echo "  --cmsis_nn_enable_f32     Enable CMSIS-NN float32 support."
+    echo "  --cmsis_nn_enable_f16     Enable CMSIS-NN float16 support."
+    echo "  --toolchain=<TOOLCHAIN>   Toolchain can be specified (arm-none-eabi-gcc, armclang, clang, arm-zephyr-eabi-gcc, aarch64-linux-musl-gcc). Default: ${toolchain}"
     echo "  --target_cpu=<CPU>        Override the toolchain's default TARGET_CPU (e.g. cortex-m4). Switching target_cpu reuses the same cmake-out dir, so clear ${et_build_root}/cmake-out first to avoid stale per-CPU artifacts. Default: unset (toolchain default)."
     exit 0
 }
@@ -58,6 +64,9 @@ for arg in "$@"; do
         ;;
       --toolchain=*) toolchain="${arg#*=}";;
       --target_cpu=*) target_cpu="${arg#*=}";;
+      --cmsis_nn_local_path=*) cmsis_nn_local_path="${arg#*=}";;
+      --cmsis_nn_enable_f32) cmsis_nn_enable_f32=ON ;;
+      --cmsis_nn_enable_f16) cmsis_nn_enable_f16=ON ;;
       *)
       ;;
     esac
@@ -65,6 +74,11 @@ done
 
 if [[ ${toolchain} == "arm-none-eabi-gcc" ]]; then
     toolchain_cmake=${et_root_dir}/examples/arm/ethos-u-setup/${toolchain}.cmake
+elif [[ ${toolchain} == "armclang" || ${toolchain} == "clang" ]]; then
+    toolchain_cmake=${et_root_dir}/examples/arm/ethos-u-setup/${toolchain}.cmake
+    if [[ -z "${target_cpu}" ]]; then
+        target_cpu=cortex-m55
+    fi
 elif [[ ${toolchain} == "arm-zephyr-eabi-gcc" ]]; then
     toolchain_cmake=${et_root_dir}/examples/zephyr/x86_64-linux-arm-zephyr-eabi-gcc.cmake
 elif [[ ${toolchain} == "aarch64-linux-musl-gcc" ]]; then
@@ -72,7 +86,7 @@ elif [[ ${toolchain} == "aarch64-linux-musl-gcc" ]]; then
     is_linux_musl=1
 else
     echo "Error: Invalid toolchain selection, provided: ${toolchain}"
-    echo "    Valid options are {arm-none-eabi-gcc, arm-zephyr-eabi-gcc, aarch64-linux-musl-gcc}"
+    echo "    Valid options are {arm-none-eabi-gcc, armclang, clang, arm-zephyr-eabi-gcc, aarch64-linux-musl-gcc}"
     exit 1;
 fi
 toolchain_cmake=$(realpath ${toolchain_cmake})
@@ -85,6 +99,24 @@ toolchain_cmake=$(realpath ${toolchain_cmake})
 source ${setup_path_script}
 
 et_build_dir="${et_build_root}/cmake-out"
+if [[ ${toolchain} == "armclang" ]]; then
+    ac6_bin_dir="${AC6_TOOLCHAIN:-}"
+    if [[ ! -x "${ac6_bin_dir}/armclang" ]]; then
+        echo "Error: armclang not found in '${ac6_bin_dir}'."
+        echo "       Export AC6_TOOLCHAIN to a recent Arm Compiler 6 bin directory."
+        exit 1
+    fi
+    export PATH="${ac6_bin_dir}:${PATH}"
+    et_build_dir="${et_build_root}/cmake-out-armclang"
+elif [[ ${toolchain} == "clang" ]]; then
+    clang_bin_dir="${CLANG_TOOLCHAIN_ROOT:-}"
+    if [[ ! -x "${clang_bin_dir}/clang" ]]; then
+        echo "Error: clang not found in '${clang_bin_dir}'."
+        echo "       Export CLANG_TOOLCHAIN_ROOT to the LLVM/Clang bin directory."
+        exit 1
+    fi
+    et_build_dir="${et_build_root}/cmake-out-clang"
+fi
 
 set -x
 cd "${et_root_dir}"
@@ -102,16 +134,30 @@ cmake_args=(
     -DEXECUTORCH_BAREMETAL_SKIP_INSTALL=OFF
 )
 if ((${#extra_cmake_args[@]})); then
-      cmake_args+=("${extra_cmake_args[@]}")
-fi
-
-if [[ ${#extra_cmake_args[@]} -gt 0 ]]; then
     cmake_args+=("${extra_cmake_args[@]}")
 fi
 
 if [[ -n "${target_cpu}" ]]; then
     cmake_args+=(-DTARGET_CPU=${target_cpu})
 fi
+
+if [[ "${target_cpu}" == cortex-m* ]]; then
+    cmake_args+=(-DEXECUTORCH_PAL_DEFAULT=minimal)
+    cmake_args+=(-DEXECUTORCH_PAL_DEFAULT_FILE_PATH=${et_root_dir}/runtime/platform/default/minimal.cpp)
+    if [[ ${toolchain} == "armclang" ]]; then
+        cmake_args+=(-DCMAKE_POSITION_INDEPENDENT_CODE=OFF)
+    fi
+fi
+
+if [[ ${toolchain} == "clang" ]]; then
+    cmake_args+=(-DFLATCC_ALLOW_WERROR=OFF)
+fi
+
+if [[ -n "${cmsis_nn_local_path}" ]]; then
+    cmake_args+=(-DCMSIS_NN_LOCAL_PATH=$(realpath "${cmsis_nn_local_path}"))
+fi
+cmake_args+=(-DARM_NN_ENABLE_F32=${cmsis_nn_enable_f32})
+cmake_args+=(-DARM_NN_ENABLE_F16=${cmsis_nn_enable_f16})
 
 if [[ ${is_linux_musl} -eq 1 ]]; then
     if [[ -z "${MUSL_TOOLCHAIN_ROOT:-}" ]]; then

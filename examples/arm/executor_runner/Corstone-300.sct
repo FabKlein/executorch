@@ -1,0 +1,61 @@
+; Copyright 2026 Arm Limited and/or its affiliates.
+;
+; Scatter-loading description for the Corstone-300 semihosting runner.
+; Keep RO code in ITCM, runtime data in DTCM, tensor arena in SRAM, and
+; semihosted assets / model data in DDR + BRAM. Use separate load regions to
+; avoid inflating the ITCM image with all RW initialization payloads.
+
+LOAD_REGION_ITCM 0x10000000 0x00080000
+{
+    itcm.bin 0x10000000 0x00080000
+    {
+        *.o (RESET, +First)
+        * (InRoot$$Sections, .init_array*, .ARM*)
+        startup_ARMCM55.o
+        .ANY2 (+RO)
+    }
+}
+
+LOAD_REGION_DTCM 0x30000000 0x00080000
+{
+    dtcm.bin 0x30000000 0x00060000
+    {
+        .ANY (+RW +ZI)
+    }
+
+    ARM_LIB_HEAP  0x30060000 EMPTY ALIGN 8 0x00008000 {}
+    ARM_LIB_STACK 0x30070000 EMPTY ALIGN 8 0x00008000 {}
+}
+
+LOAD_REGION_SRAM 0x31000000 0x00200000
+{
+    isram.bin 0x31000000 UNINIT ALIGN 16 0x00200000
+    {
+        * (.bss.tensor_arena)
+        * (.bss.ethosu_scratch)
+        * (output_data_sec)
+    }
+}
+
+LOAD_REGION_BRAM 0x11000000 0x00100000
+{
+    bram.bin 0x11000000 ALIGN 8 0x00100000
+    {
+        .ANY1 (+RO)
+        * (.sram.data)
+    }
+}
+
+LOAD_REGION_DDR 0x70000000 0x60000000
+{
+    ddr.bin 0x70000000 ALIGN 16 0x60000000
+    {
+        * (input_data_sec)
+        * (network_model_sec)
+        * (expected_output_data_sec)
+        * (sec_command_stream, sec_weight_data, sec_input_data)
+        * (.got*)
+        * (ethosu_core_in_queue)
+        * (ethosu_core_out_queue)
+    }
+}

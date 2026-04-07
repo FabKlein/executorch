@@ -203,6 +203,26 @@ set(_arm_runner_normal_archive_libs
     portable_kernels kernels_util_all_deps arm_prim_ops_lib_impl
     quantized_kernels cortex_m_kernels cmsis-nn
 )
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "ARMClang" OR CMAKE_CXX_COMPILER_ID STREQUAL
+                                                 "Clang"
+)
+  # These toolchains use explicit registration rather than relying on static
+  # constructors being retained from selective registration archives.
+  target_compile_definitions(
+    arm_cortex_m_ops_lib
+    PRIVATE ET_REGISTER_KERNELS_FN=executorch_arm_register_cortex_m_ops
+  )
+  target_compile_definitions(
+    arm_portable_ops_lib
+    PRIVATE ET_REGISTER_KERNELS_FN=executorch_arm_register_portable_ops
+  )
+  target_compile_definitions(
+    arm_executor_runner PRIVATE EXECUTORCH_ARM_EXPLICIT_KERNEL_REGISTRATION
+                               EXECUTORCH_ARM_HAS_PORTABLE_OP_REGISTRATION
+  )
+endif()
+
 arm_runner_link_registration_libraries(
   TARGET
   arm_executor_runner
@@ -280,9 +300,15 @@ endif()
 # Ensure the ELF lands next to the CMake build tree so run.sh (and downstream
 # tooling) can locate it deterministically regardless of multi-config vs
 # single-config generators.
-target_link_options(
-  arm_executor_runner PUBLIC LINKER:-Map=arm_executor_runner.map
-)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "ARMClang")
+  target_link_options(
+    arm_executor_runner PUBLIC "--map" "--list=arm_executor_runner.map"
+  )
+else()
+  target_link_options(
+    arm_executor_runner PUBLIC LINKER:-Map=arm_executor_runner.map
+  )
+endif()
 # Reuse a parent build's output directory if it already set one; otherwise keep
 # the runner ELF next to this build tree so run.sh can find it predictably.
 arm_runner_configure_runtime_output(arm_executor_runner "${CMAKE_BINARY_DIR}")

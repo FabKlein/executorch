@@ -638,17 +638,27 @@ function(arm_runner_link_registration_libraries)
     endif()
   endforeach()
 
-  target_link_libraries(
-    ${ARG_TARGET}
-    ${ARG_SCOPE}
-    -Wl,--start-group
-    ${ARG_BASE_LIBS}
-    -Wl,--whole-archive
-    ${ARG_REGISTRATION_LIBS}
-    -Wl,--no-whole-archive
-    ${ARG_NORMAL_LIBS}
-    -Wl,--end-group
-  )
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "ARMClang")
+    # armlink does not accept GNU archive-group options. ArmClang runners call
+    # stable generated registration functions, which pulls the required
+    # registration objects from their static libraries explicitly.
+    target_link_libraries(
+      ${ARG_TARGET} ${ARG_SCOPE} ${ARG_BASE_LIBS} ${ARG_REGISTRATION_LIBS}
+      ${ARG_NORMAL_LIBS}
+    )
+  else()
+    target_link_libraries(
+      ${ARG_TARGET}
+      ${ARG_SCOPE}
+      -Wl,--start-group
+      ${ARG_BASE_LIBS}
+      -Wl,--whole-archive
+      ${ARG_REGISTRATION_LIBS}
+      -Wl,--no-whole-archive
+      ${ARG_NORMAL_LIBS}
+      -Wl,--end-group
+    )
+  endif()
 endfunction()
 
 function(arm_runner_configure_runtime_output TARGET_NAME FALLBACK_DIR)
@@ -719,16 +729,32 @@ function(arm_runner_configure_linker_script)
     CONTEXT arm_runner_configure_linker_script TARGETS ${ARG_TARGET}
   )
 
-  get_corstone_linker_script(_linker_script "${ARG_SYSTEM_CONFIG}")
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "ARMClang")
+    if(NOT ARG_SYSTEM_CONFIG MATCHES "U55")
+      message(FATAL_ERROR "ArmClang runner scatter support currently targets Corstone-300/U55 only.")
+    endif()
+    set(_linker_script
+        "${EXECUTORCH_ROOT}/examples/arm/executor_runner/Corstone-300.sct"
+    )
+    set(LINK_FILE_EXT scatter)
+    set(LINK_FILE_OPTION "--scatter")
+    set(COMPILER_PREPROCESSOR_OPTIONS
+        -mcpu=${CMAKE_SYSTEM_PROCESSOR} --target=arm-arm-none-eabi -E -x c -P
+    )
+  else()
+    get_corstone_linker_script(_linker_script "${ARG_SYSTEM_CONFIG}")
+  endif()
 
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL
+                                                 "Clang"
+  )
     set(LINK_FILE_EXT ld)
     set(LINK_FILE_OPTION "-T")
     set(COMPILER_PREPROCESSOR_OPTIONS -E -x c -P)
-  else()
+  elseif(NOT CMAKE_CXX_COMPILER_ID STREQUAL "ARMClang")
     message(
       FATAL_ERROR
-        "arm_runner_configure_linker_script only supports the GNU compiler."
+        "arm_runner_configure_linker_script does not support ${CMAKE_CXX_COMPILER_ID}."
     )
   endif()
 
@@ -752,4 +778,7 @@ function(arm_runner_configure_linker_script)
   target_link_options(
     ${ARG_TARGET} PRIVATE "${LINK_FILE_OPTION}" "${_linker_script_out}"
   )
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "ARMClang")
+    target_link_options(${ARG_TARGET} PRIVATE "--datacompressor=off")
+  endif()
 endfunction()

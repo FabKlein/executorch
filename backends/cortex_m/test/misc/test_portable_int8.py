@@ -791,7 +791,10 @@ FVP_OP_CASES = {key: val for key, val in OP_CASES.items() if key in FVP_OP_CASES
 @parametrize("op_case", FVP_OP_CASES)
 def test_shared_qspec_portable_int8_ops_fvp(op_case: OpCase) -> None:
     tester = CortexMTester(op_case.module, op_case.example_inputs)
-    tester.test_implementation()
+    # This subset intentionally leaves portable data-movement ops in the final
+    # program, so execute it with the portable-op runner rather than the
+    # Cortex-M-only runner.
+    tester.test_implementation(use_portable_ops=True)
 
 
 def test_shared_qspec_ops_default_covered() -> None:

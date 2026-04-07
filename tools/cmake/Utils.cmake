@@ -129,6 +129,9 @@ function(executorch_target_link_options_shared_lib target_name)
     executorch_macos_kernel_link_options(${target_name})
   elseif(MSVC)
     executorch_msvc_kernel_link_options(${target_name})
+  elseif(CMAKE_CXX_COMPILER_ID STREQUAL "ARMClang")
+    # armlink does not accept the GNU whole-archive spelling. Keep the normal
+    # static-link path for now.
   else()
     executorch_kernel_link_options(${target_name})
   endif()

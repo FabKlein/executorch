@@ -1,4 +1,4 @@
-# Copyright 2026 Arm Limited and/or its affiliates.
+# Copyright 2025-2026 Arm Limited and/or its affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -6,7 +6,8 @@
 from typing import cast, Dict
 
 import torch
-from executorch.exir.pass_base import ExportPass, NodeMetadata, ProxyValue
+from executorch.exir.dialects._ops import ops as exir_ops
+from executorch.exir.pass_base import ExportPass, NodeMetadata, PassResult, ProxyValue
 
 from torch._ops import OpOverload
 from torch.fx.node import Argument
@@ -14,9 +15,117 @@ from torch.fx.node import Argument
 
 class DecomposeMeanPass(ExportPass):
     """
-    Rewrites AdaptiveAvgPool2d and spatial mean.dim into AvgPool2d, which
-    CMSIS-NN has a kernel for. Both are spellings of the same classifier head.
+    Rewrites adaptive pooling and spatial mean forms into AvgPool2d-friendly
+    classifier tails that CMSIS-NN can lower.
     """
+
+    @staticmethod
+    def _unwrap_dims(dim_arg: Argument) -> list[int] | None:
+        if dim_arg is None:
+            return None
+        if isinstance(dim_arg, (list, tuple)):
+            return [int(d) for d in dim_arg]
+        return None
+
+    def _rewrite_global_mean_chain(
+        self, graph_module: torch.fx.GraphModule
+    ) -> tuple[torch.fx.GraphModule, bool]:
+        graph = graph_module.graph
+        modified = False
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or node.target != exir_ops.edge.aten.mean.dim
+                or len(node.args) < 2
+            ):
+                continue
+
+            second_dims = self._unwrap_dims(cast(Argument, node.args[1]))
+            second_keepdim = bool(node.args[2]) if len(node.args) > 2 else False
+            if second_dims != [2] or second_keepdim:
+                continue
+
+            prev_mean = node.args[0]
+            if not isinstance(prev_mean, torch.fx.Node):
+                continue
+            if (
+                prev_mean.op != "call_function"
+                or prev_mean.target != exir_ops.edge.aten.mean.dim
+                or len(prev_mean.args) < 2
+            ):
+                continue
+
+            first_dims = self._unwrap_dims(cast(Argument, prev_mean.args[1]))
+            first_keepdim = (
+                bool(prev_mean.args[2]) if len(prev_mean.args) > 2 else False
+            )
+            # Match the common classifier tail:
+            #
+            #   [N, C, H, W]
+            #      -> mean(dim=[3], keepdim=False)
+            #      -> mean(dim=[2], keepdim=False)
+            #      -> [N, C]
+            #
+            # and normalize it to:
+            #
+            #   [N, C, H, W]
+            #      -> avg_pool2d(kernel=[H, W], stride=[H, W])
+            #      -> view_copy([N, C])
+            if first_dims not in ([2], [3]) or first_keepdim:
+                continue
+
+            original_input = prev_mean.args[0]
+            if not isinstance(original_input, torch.fx.Node):
+                continue
+            input_val = original_input.meta.get("val")
+            if input_val is None or len(input_val.shape) != 4:
+                continue
+
+            # Use one global avg-pool over the full spatial size so downstream
+            # Cortex-M pooling lowering can recognize and replace it with the
+            # backend pool op.
+            kernel_size = [int(input_val.shape[-2]), int(input_val.shape[-1])]
+            avg_args = (
+                original_input,
+                kernel_size,
+                kernel_size,
+                [0, 0],
+                False,
+                False,
+                None,
+            )
+
+            with graph.inserting_before(node):
+                avg_node = graph.create_node(
+                    "call_function", exir_ops.edge.aten.avg_pool2d.default, avg_args
+                )
+                avg_val = exir_ops.edge.aten.avg_pool2d.default(
+                    input_val, kernel_size, kernel_size, [0, 0], False, False, None
+                )
+                avg_node.meta = dict(node.meta)
+                avg_node.meta["val"] = avg_val
+
+                # The chained mean form returns [N, C], so finish the rewrite by
+                # dropping the trailing 1x1 spatial dimensions.
+                output_shape = [int(input_val.shape[0]), int(input_val.shape[1])]
+                view_node = graph.create_node(
+                    "call_function",
+                    exir_ops.edge.aten.view_copy.default,
+                    (avg_node, output_shape),
+                )
+                view_node.meta = dict(node.meta)
+                view_node.meta["val"] = exir_ops.edge.aten.view_copy.default(
+                    avg_val, output_shape
+                )
+
+            node.replace_all_uses_with(view_node)
+            modified = True
+
+        if modified:
+            graph.eliminate_dead_code()
+            graph_module.recompile()
+        return graph_module, modified
 
     def call_operator(
         self,
@@ -102,3 +211,10 @@ class DecomposeMeanPass(ExportPass):
         return super().call_operator(
             torch.ops.aten.view.default, (pooled, [n, c]), {}, meta
         )
+
+    def call(self, graph_module: torch.fx.GraphModule) -> PassResult:
+        # First do the graph-level mean-chain normalization, then reuse the
+        # per-op adaptive_avg_pool2d/spatial mean decomposition.
+        graph_module, chain_modified = self._rewrite_global_mean_chain(graph_module)
+        result = super().call(graph_module)
+        return PassResult(result.graph_module, chain_modified or result.modified)

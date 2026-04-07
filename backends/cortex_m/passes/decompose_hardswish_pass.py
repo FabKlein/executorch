@@ -3,12 +3,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-
 import logging
 
 import executorch.backends.cortex_m.ops.operators  # noqa: F401
 
 import torch
+from executorch.backends.arm._passes.arm_pass_utils import get_first_fake_tensor
 from executorch.backends.arm._passes.quant_args import QuantArgs
 
 from executorch.backends.cortex_m.passes.passes_utils import quantize_val
@@ -63,6 +63,19 @@ class DecomposeHardswishPass(ExportPass):
                 logger.warning(
                     f"Cannot fuse activation {node.name} as input node {input_node.name} has multiple users."
                 )
+                continue
+
+            input_tensor = get_first_fake_tensor(input_node)
+            if input_tensor is None or input_tensor.dtype not in (
+                torch.int8,
+                torch.int16,
+            ):
+                continue
+
+            output_qparams = input_node.meta.get("output_qparams", {})
+            input_qparams = node.meta.get("input_qparams", {})
+            node_output_qparams = node.meta.get("output_qparams", {})
+            if output_qparams == {} or input_qparams == {} or node_output_qparams == {}:
                 continue
 
             input_quant_dict = input_node.meta.get("output_qparams", [None])[

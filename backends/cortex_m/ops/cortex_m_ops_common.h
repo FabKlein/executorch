@@ -18,17 +18,48 @@
 #include <executorch/runtime/platform/assert.h>
 
 #include <cinttypes>
+#include <cstring>
 #include <limits>
 #include <optional>
+#include <type_traits>
 
+// `arm_nnfunctions.h` includes the CMSIS-NN math types too, but several
+// quantized translation units include this common header before including the
+// public function header. Pull the math types directly so shared helpers that
+// mention float32_t / float16_t are self-contained and include-order safe.
+#include "arm_nn_math_types.h"
 #include "arm_nn_types.h"
 #include "arm_nnfunctions.h"
+
+// Some shared helpers still refer to the finite fp16 bounds even in f32-only
+// builds. Keep local fallbacks for those macros so the shared code still
+// compiles when the float16 API surface is disabled.
+#if !(defined(ARM_NN_ENABLE_F16) && ARM_NN_ENABLE_F16)
+#ifndef ARM_NN_F16_FINITE_MAX
+#define ARM_NN_F16_FINITE_MAX ((float16_t)0)
+#endif
+#ifndef ARM_NN_F16_FINITE_LOWEST
+#define ARM_NN_F16_FINITE_LOWEST ((float16_t)0)
+#endif
+#endif
 
 using Tensor = torch::executor::Tensor;
 using ScalarType = executorch::aten::ScalarType;
 using Error = executorch::runtime::Error;
 using Int64ArrayRef = executorch::aten::ArrayRef<int64_t>;
 using KernelRuntimeContext = torch::executor::KernelRuntimeContext;
+
+#if defined(ARM_NN_ENABLE_F32) && ARM_NN_ENABLE_F32
+constexpr bool kCmsisFloat32Enabled = true;
+#else
+constexpr bool kCmsisFloat32Enabled = false;
+#endif
+
+#if defined(ARM_NN_ENABLE_F16) && ARM_NN_ENABLE_F16
+constexpr bool kCmsisFloat16Enabled = true;
+#else
+constexpr bool kCmsisFloat16Enabled = false;
+#endif
 
 // From arm_nn_math_types.h
 #define ARM_NN_Q31_MAX ((int32_t)(0x7FFFFFFFL))
@@ -41,6 +72,131 @@ enum class ActivationLayout {
   NCHWLogical,
   NHWCLogical,
 };
+
+template <typename ScalarT>
+inline constexpr int32_t get_cmsis_packed_n_block_cols() {
+  if constexpr (std::is_same_v<ScalarT, float16_t>) {
+    return 8;
+  } else if constexpr (std::is_same_v<ScalarT, float32_t>) {
+    return 4;
+  } else {
+    static_assert(
+        std::is_same_v<ScalarT, float16_t> ||
+            std::is_same_v<ScalarT, float32_t>,
+        "Packed CMSIS float weights are only supported for float16_t/float32_t");
+    return 0;
+  }
+}
+
+template <typename ParamsT, typename = void>
+struct has_cmsis_weight_format : std::false_type {};
+
+template <typename ParamsT>
+struct has_cmsis_weight_format<
+    ParamsT,
+    std::void_t<decltype(std::declval<ParamsT&>().weight_format)>>
+    : std::true_type {};
+
+template <typename ParamsT, typename = void>
+struct has_cmsis_rhs_format : std::false_type {};
+
+template <typename ParamsT>
+struct has_cmsis_rhs_format<
+    ParamsT,
+    std::void_t<decltype(std::declval<ParamsT&>().rhs_format)>>
+    : std::true_type {};
+
+template <typename ParamsT>
+inline void set_standard_cmsis_weight_format(ParamsT& params) {
+  if constexpr (has_cmsis_weight_format<ParamsT>::value) {
+    params.weight_format = ARM_NN_WEIGHT_FORMAT_STANDARD;
+  }
+}
+
+template <typename ParamsT>
+inline void set_packed_cmsis_weight_format(ParamsT& params) {
+  if constexpr (has_cmsis_weight_format<ParamsT>::value) {
+    params.weight_format = ARM_NN_WEIGHT_FORMAT_NT_N_PACKED;
+  }
+}
+
+template <typename ParamsT>
+inline void set_standard_cmsis_rhs_format(ParamsT& params) {
+  if constexpr (has_cmsis_rhs_format<ParamsT>::value) {
+    params.rhs_format = ARM_NN_WEIGHT_FORMAT_STANDARD;
+  }
+}
+
+template <typename ParamsT>
+inline void set_packed_cmsis_rhs_format(ParamsT& params) {
+  if constexpr (has_cmsis_rhs_format<ParamsT>::value) {
+    params.rhs_format = ARM_NN_WEIGHT_FORMAT_NT_N_PACKED;
+  }
+}
+
+template <typename ScalarT, typename PoolParamsT>
+inline void fill_float_pool_params(
+    PoolParamsT& pool_params,
+    int32_t pad_h,
+    int32_t pad_w,
+    int32_t stride_h,
+    int32_t stride_w) {
+  pool_params.padding.h = pad_h;
+  pool_params.padding.w = pad_w;
+  pool_params.stride.h = stride_h;
+  pool_params.stride.w = stride_w;
+  if constexpr (std::is_same_v<ScalarT, float16_t>) {
+    pool_params.activation.min = ARM_NN_F16_FINITE_LOWEST;
+    pool_params.activation.max = ARM_NN_F16_FINITE_MAX;
+  } else {
+    pool_params.activation.min = ARM_NN_F32_FINITE_LOWEST;
+    pool_params.activation.max = ARM_NN_F32_FINITE_MAX;
+  }
+}
+
+template <typename ScalarT>
+inline size_t get_nt_n_packed_weight_bytes(int32_t rhs_rows, int32_t rhs_cols) {
+  constexpr int32_t kBlockCols = get_cmsis_packed_n_block_cols<ScalarT>();
+  // CMSIS packs the logical RHS [rows, cols] matrix in row-blocks of
+  // kBlockCols output channels. The last block is padded up to the full block
+  // width, so the storage size is based on the rounded-up row count.
+  const int32_t rhs_blocks = (rhs_rows + kBlockCols - 1) / kBlockCols;
+  return static_cast<size_t>(rhs_blocks) * static_cast<size_t>(rhs_cols) *
+      kBlockCols * sizeof(ScalarT);
+}
+
+template <typename ScalarT>
+inline void pack_nt_t_weights_to_nt_n_packed(
+    const ScalarT* rhs_nt,
+    int32_t rhs_rows,
+    int32_t rhs_cols,
+    ScalarT* rhs_packed) {
+  constexpr int32_t kBlockCols = get_cmsis_packed_n_block_cols<ScalarT>();
+  const int32_t rhs_blocks = (rhs_rows + kBlockCols - 1) / kBlockCols;
+  const size_t packed_elements = static_cast<size_t>(rhs_blocks) *
+      static_cast<size_t>(rhs_cols) * kBlockCols;
+  // Zero-fill the full packed buffer first so the tail lanes in the final
+  // partial block are already padded as expected by the CMSIS packed kernels.
+  std::memset(rhs_packed, 0, packed_elements * sizeof(ScalarT));
+
+  for (int32_t block = 0; block < rhs_blocks; ++block) {
+    const int32_t col_base = block * kBlockCols;
+    ScalarT* packed_block =
+        rhs_packed + static_cast<size_t>(block) * rhs_cols * kBlockCols;
+    // Within each row-block, CMSIS expects [k][lane] order:
+    //   packed_block[k * kBlockCols + lane] = rhs_nt[row=col_base+lane][k]
+    // This groups kBlockCols output rows together for each logical K position.
+    for (int32_t k = 0; k < rhs_cols; ++k) {
+      for (int32_t lane = 0; lane < kBlockCols; ++lane) {
+        const int32_t col = col_base + lane;
+        if (col < rhs_rows) {
+          packed_block[static_cast<size_t>(k) * kBlockCols + lane] =
+              rhs_nt[static_cast<size_t>(col) * rhs_cols + k];
+        }
+      }
+    }
+  }
+}
 
 // Basic tensor type / layout validation and dimension order checking
 inline void validate_cmsis_nn_tensor_requirements(
@@ -136,7 +292,11 @@ inline bool is_channels_last_tensor(const Tensor& tensor) {
     return false;
   }
 
-  // When channels or spatial dims are 1 the layout information is ambiguous.
+  // Degenerate 1x1-style shapes are layout-ambiguous: NHWC and NCHW collapse
+  // to the same logical indexing when the channel or both spatial dims are 1.
+  // We intentionally accept those cases as channels-last to avoid false
+  // negatives in small feature-map tails, even though this can mask some
+  // layout bugs for degenerate shapes.
   if (tensor.size(1) == 1 || (tensor.size(2) == 1 && tensor.size(3) == 1)) {
     return true;
   }
@@ -147,6 +307,36 @@ inline bool is_channels_last_tensor(const Tensor& tensor) {
       channels_last_order(kChannelsLastDimOrder, 4);
 
   return tensor.dim_order() == channels_last_order;
+}
+
+inline bool is_default_dim_order_tensor(const Tensor& tensor) {
+  // Quietly check for the canonical contiguous/default dim order:
+  //
+  //   rank-4 default:       [0, 1, 2, 3]  // logical NCHW
+  //   rank-4 channels-last: [0, 2, 3, 1]  // logical NHWC storage
+  //
+  // runtime::tensor_is_default_dim_order() performs a similar check, but logs
+  // an error when the tensor is not default. That is too noisy for Cortex-M
+  // float kernels because a non-default channels-last tensor is often the
+  // expected fast path, not an error.
+  const auto dim_order = tensor.dim_order();
+  if (dim_order.size() != static_cast<size_t>(tensor.dim())) {
+    return false;
+  }
+
+  for (size_t i = 0; i < dim_order.size(); ++i) {
+    if (dim_order[i] != static_cast<executorch::aten::DimOrderType>(i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool is_default_or_channels_last_tensor(const Tensor& tensor) {
+  // Avoid runtime::tensor_is_default_dim_order() here: it logs an error for
+  // non-default tensors, but Cortex-M float ops often probe channels-last
+  // tensors as part of valid layout dispatch.
+  return is_default_dim_order_tensor(tensor) || is_channels_last_tensor(tensor);
 }
 
 inline bool is_channel_broadcast(const Tensor& tensor1, const Tensor& tensor2) {
@@ -187,6 +377,228 @@ inline bool check_int32_within_range(
   }
   out_value = static_cast<int32_t>(value);
   return true;
+}
+
+template <typename ScalarT>
+inline bool prepare_float_pool2d_config(
+    KernelRuntimeContext& context,
+    const char* op_name,
+    const Tensor& input,
+    Tensor& output,
+    const Int64ArrayRef& kernel_size,
+    const Int64ArrayRef& stride,
+    const Int64ArrayRef& padding,
+    cmsis_nn_dims& input_dims,
+    cmsis_nn_dims& filter_dims,
+    cmsis_nn_dims& output_dims,
+    int32_t& pad_h,
+    int32_t& pad_w,
+    int32_t& stride_h,
+    int32_t& stride_w,
+    bool require_positive_kernel_stride = false) {
+  if (input.dim() != 4 || output.dim() != 4) {
+    ET_LOG(Error, "%s: tensors must be 4-D", op_name);
+    context.fail(Error::InvalidArgument);
+    return false;
+  }
+
+  const ScalarType expected_dtype =
+      std::is_same_v<ScalarT, float32_t> ? ScalarType::Float : ScalarType::Half;
+  if (input.scalar_type() != expected_dtype ||
+      output.scalar_type() != expected_dtype) {
+    ET_LOG(
+        Error,
+        "%s: tensors must be %s",
+        op_name,
+        expected_dtype == ScalarType::Float ? "float32" : "float16");
+    context.fail(Error::InvalidArgument);
+    return false;
+  }
+
+  if (input.size(0) != output.size(0) || input.size(1) != output.size(1)) {
+    ET_LOG(
+        Error,
+        "%s: batch and channel dimensions must match between input and output",
+        op_name);
+    context.fail(Error::InvalidArgument);
+    return false;
+  }
+
+  if (!is_channels_last_tensor(input) || !is_channels_last_tensor(output)) {
+    ET_LOG(
+        Error, "%s: tensors must use channels_last dimension order", op_name);
+    context.fail(Error::InvalidArgument);
+    return false;
+  }
+
+  auto check_tuple_len = [&](const Int64ArrayRef& arr,
+                             const char* name) -> bool {
+    if (arr.size() != 2) {
+      ET_LOG(Error, "%s: %s must have length 2", op_name, name);
+      context.fail(Error::InvalidArgument);
+      return false;
+    }
+    return true;
+  };
+
+  if (!check_tuple_len(kernel_size, "kernel_size") ||
+      !check_tuple_len(stride, "stride") ||
+      !check_tuple_len(padding, "padding")) {
+    return false;
+  }
+
+  int32_t kernel_h, kernel_w, batch, channels, input_h, input_w, output_h,
+      output_w;
+  if (!check_int32_within_range(
+          context, op_name, kernel_size[0], "kernel_size[0]", kernel_h) ||
+      !check_int32_within_range(
+          context, op_name, kernel_size[1], "kernel_size[1]", kernel_w) ||
+      !check_int32_within_range(
+          context, op_name, stride[0], "stride[0]", stride_h) ||
+      !check_int32_within_range(
+          context, op_name, stride[1], "stride[1]", stride_w) ||
+      !check_int32_within_range(
+          context, op_name, padding[0], "padding[0]", pad_h) ||
+      !check_int32_within_range(
+          context, op_name, padding[1], "padding[1]", pad_w) ||
+      !check_int32_within_range(
+          context, op_name, input.size(0), "input batch", batch) ||
+      !check_int32_within_range(
+          context, op_name, input.size(1), "input channels", channels) ||
+      !check_int32_within_range(
+          context, op_name, input.size(2), "input height", input_h) ||
+      !check_int32_within_range(
+          context, op_name, input.size(3), "input width", input_w) ||
+      !check_int32_within_range(
+          context, op_name, output.size(2), "output height", output_h) ||
+      !check_int32_within_range(
+          context, op_name, output.size(3), "output width", output_w)) {
+    return false;
+  }
+
+  input_dims = cmsis_nn_dims{batch, input_h, input_w, channels};
+  filter_dims = cmsis_nn_dims{1, kernel_h, kernel_w, 1};
+  output_dims = cmsis_nn_dims{batch, output_h, output_w, channels};
+
+  if (require_positive_kernel_stride &&
+      (stride_h <= 0 || stride_w <= 0 || kernel_h <= 0 || kernel_w <= 0)) {
+    ET_LOG(
+        Error, "%s: kernel_size and stride values must be positive", op_name);
+    context.fail(Error::InvalidArgument);
+    return false;
+  }
+
+  return true;
+}
+
+inline void fail_cmsis_float_kernel_unavailable(
+    KernelRuntimeContext& context,
+    const char* op_name,
+    const char* dtype_name) {
+  ET_LOG(
+      Error,
+      "%s: CMSIS-NN %s support is disabled in this build",
+      op_name,
+      dtype_name);
+  context.fail(Error::InvalidArgument);
+}
+
+// Custom activation tags for small activation forms that CMSIS-NN does not
+// expose directly.
+// Not native CMSIS-NN arm_nn_activation_type_flt values.
+// Deliberately far above the current CMSIS-NN float activation enum range
+// (which ends at ARM_NN_FLT_ACT_LEAKY_RELU = 38 as of CMSIS-NN 6.x) to
+// avoid collisions with any future upstream additions.
+// Must match float_activation_constants.py.
+constexpr int64_t kCortexMFloatActHardsigmoid = 0x100;
+constexpr int64_t kCortexMFloatActHardtanh = 0x101;
+
+// Shared float type utilities for ops templated on CMSIS scalar types
+// (float32_t / float16_t).
+template <typename ScalarT>
+constexpr bool is_cmsis_float_enabled() {
+#if defined(ARM_NN_ENABLE_F32) && ARM_NN_ENABLE_F32
+  if constexpr (std::is_same_v<ScalarT, float32_t>) {
+    return kCmsisFloat32Enabled;
+  }
+#endif
+#if defined(ARM_NN_ENABLE_F16) && ARM_NN_ENABLE_F16
+  if constexpr (std::is_same_v<ScalarT, float16_t>) {
+    return kCmsisFloat16Enabled;
+  }
+#endif
+  return false;
+}
+
+template <typename ScalarT>
+inline const char* cmsis_float_dtype_name() {
+#if defined(ARM_NN_ENABLE_F32) && ARM_NN_ENABLE_F32
+  if constexpr (std::is_same_v<ScalarT, float32_t>) {
+    return "float32";
+  }
+#endif
+#if defined(ARM_NN_ENABLE_F16) && ARM_NN_ENABLE_F16
+  if constexpr (std::is_same_v<ScalarT, float16_t>) {
+    return "float16";
+  }
+#endif
+  return "unknown";
+}
+
+template <typename ScalarT>
+inline ScalarType cmsis_float_scalar_type() {
+#if defined(ARM_NN_ENABLE_F32) && ARM_NN_ENABLE_F32
+  if constexpr (std::is_same_v<ScalarT, float32_t>) {
+    return ScalarType::Float;
+  }
+#endif
+#if defined(ARM_NN_ENABLE_F16) && ARM_NN_ENABLE_F16
+  if constexpr (std::is_same_v<ScalarT, float16_t>) {
+    return ScalarType::Half;
+  }
+#endif
+  ET_CHECK_MSG(false, "Unsupported CMSIS float scalar type");
+  return ScalarType::Float;
+}
+
+template <typename ScalarT>
+inline const ScalarT* cmsis_const_data_ptr(const Tensor& tensor) {
+#if defined(ARM_NN_ENABLE_F32) && ARM_NN_ENABLE_F32
+  if constexpr (std::is_same_v<ScalarT, float32_t>) {
+    return tensor.const_data_ptr<float32_t>();
+  }
+#endif
+#if defined(ARM_NN_ENABLE_F16) && ARM_NN_ENABLE_F16
+  if constexpr (std::is_same_v<ScalarT, float16_t>) {
+    static_assert(
+        sizeof(executorch::aten::Half) == sizeof(float16_t),
+        "ExecuTorch Half and CMSIS float16_t must have identical storage");
+    return reinterpret_cast<const float16_t*>(
+        tensor.const_data_ptr<executorch::aten::Half>());
+  }
+#endif
+  ET_CHECK_MSG(false, "Unsupported CMSIS float scalar type");
+  return nullptr;
+}
+
+template <typename ScalarT>
+inline ScalarT* cmsis_mutable_data_ptr(Tensor& tensor) {
+#if defined(ARM_NN_ENABLE_F32) && ARM_NN_ENABLE_F32
+  if constexpr (std::is_same_v<ScalarT, float32_t>) {
+    return tensor.mutable_data_ptr<float32_t>();
+  }
+#endif
+#if defined(ARM_NN_ENABLE_F16) && ARM_NN_ENABLE_F16
+  if constexpr (std::is_same_v<ScalarT, float16_t>) {
+    static_assert(
+        sizeof(executorch::aten::Half) == sizeof(float16_t),
+        "ExecuTorch Half and CMSIS float16_t must have identical storage");
+    return reinterpret_cast<float16_t*>(
+        tensor.mutable_data_ptr<executorch::aten::Half>());
+  }
+#endif
+  ET_CHECK_MSG(false, "Unsupported CMSIS float scalar type");
+  return nullptr;
 }
 
 struct CmsisPool2DConfig {

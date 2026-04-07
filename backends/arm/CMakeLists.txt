@@ -59,6 +59,12 @@ endif()
 if(EXECUTORCH_BUILD_ARM_BAREMETAL OR EXECUTORCH_BUILD_ARM_ETHOSU_LINUX)
 
   add_compile_options("-Wall" "-Werror")
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "ARMClang")
+    add_compile_options(
+      "-Wno-error=switch-default"
+      "-Wno-error=unused-parameter"
+    )
+  endif()
 
   set(_arm_backend_sources
       backends/arm/runtime/EthosUBackend.cpp
