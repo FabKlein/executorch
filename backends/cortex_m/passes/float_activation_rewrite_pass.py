@@ -19,7 +19,7 @@ from executorch.backends.cortex_m.float_activation_constants import (
     CMSIS_FLOAT_ACT_TANH,
 )
 from executorch.backends.cortex_m.passes.cortex_m_rewrite_base import CortexMRewriteBase
-from executorch.backends.cortex_m.passes.float_capabilities import (
+from executorch.backends.cortex_m.float_capabilities import (
     get_optional_cortex_m_float_op,
 )
 from executorch.backends.cortex_m.passes.passes_utils import is_channels_last

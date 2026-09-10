@@ -27,7 +27,7 @@ from executorch.backends.transforms.replace_squeeze_unsqueeze_with_view import (
     ReplaceSqueezeAndUnsqueezeWithViewPass,
 )
 from executorch.exir.pass_base import ExportPass
-from executorch.exir.pass_manager import PassManager
+from executorch.exir.pass_manager import _get_updated_graph_signature, PassManager
 from executorch.exir.program._program import _transform, lift_constant_tensor_pass
 from torch.export import ExportedProgram
 
@@ -47,7 +47,7 @@ from .explicit_layout_pass import (
     ValidateCortexMExplicitLayoutPass,
 )
 from .float_activation_rewrite_pass import FloatActivationRewritePass
-from .float_capabilities import (
+from executorch.backends.cortex_m.float_capabilities import (
     CortexMFloatCapabilities,
     get_cortex_m_float_capabilities,
 )
@@ -66,6 +66,16 @@ from .remove_unused_constant_placeholders_pass import (
 from .replace_quant_nodes_pass import ReplaceQuantNodesPass
 
 PassClass = Type[ExportPass]
+
+_FLOAT_GRAPH_SURGERY_PASSES = (
+    BypassFlattenForLinearPass,
+    CollapseFloatActivationDecompositionPass,
+    ConvertToCortexMPass,
+    FoldBatchNormIntoConvPass,
+    FoldBatchNormIntoLinearPass,
+    PackFloatConvWeightsPass,
+    RemoveUnusedConstantPlaceholdersPass,
+)
 
 
 class CortexMPassManager(PassManager):
@@ -192,7 +202,22 @@ class CortexMPassManager(PassManager):
             if "capabilities" in signature.parameters:
                 kwargs["capabilities"] = self.capabilities
 
-            exported_program = _transform(exported_program, pass_cls(**kwargs))
+            transform_pass = pass_cls(**kwargs)
+            if pass_cls in _FLOAT_GRAPH_SURGERY_PASSES:
+                # These passes update constants and graph-signature entries on
+                # the ExportedProgram supplied to their constructor. Calling
+                # them directly keeps those mutations on the same object;
+                # _transform() shallow-copies the program first on current
+                # PyTorch, which can split state_dict and signature updates.
+                result = transform_pass(exported_program.graph_module)
+                if result.modified:
+                    exported_program._graph_module = result.graph_module
+                    exported_program._graph_signature = _get_updated_graph_signature(
+                        exported_program.graph_signature, result.graph_module
+                    )
+                    exported_program.graph_module.recompile()
+            else:
+                exported_program = _transform(exported_program, transform_pass)
 
         # Float packing and folding can create new constants.
         return lift_constant_tensor_pass(exported_program)

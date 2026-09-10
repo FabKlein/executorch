@@ -22,7 +22,7 @@ from executorch.backends.cortex_m.float_activation_constants import (
     CMSIS_FLOAT_ACT_SIGMOID,
     CMSIS_FLOAT_ACT_TANH,
 )
-from executorch.backends.cortex_m.passes.float_capabilities import (
+from executorch.backends.cortex_m.float_capabilities import (
     get_cortex_m_float_capabilities,
 )
 from executorch.backends.cortex_m.passes.passes_utils import (
@@ -122,10 +122,6 @@ def quantize_per_tensor_impl(
     )
 
 
-###
-# dequantize_per_tensor
-###
-
 lib.define(
     "dequantize_per_tensor(Tensor input, float scale, int zero_point, int quant_min, int quant_max, ScalarType dtype) -> (Tensor Z)"
 )
@@ -163,6 +159,10 @@ def dequantize_per_tensor_impl(
         input, scale, zero_point, quant_min, quant_max, dtype
     )
 
+
+# -------------------------------------------------------------------
+# Quantized arithmetic operators
+# -------------------------------------------------------------------
 
 # Define the operator schema with multipliers and shifts (11 args)
 lib.define(
@@ -244,9 +244,84 @@ def quantized_add_impl(
     return result
 
 
-# ===================================================================
-# QUANTIZED MUL OPERATION DEFINITION
-# ===================================================================
+# -------------------------------------------------------------------
+# Float arithmetic operators
+# -------------------------------------------------------------------
+
+
+def _define_float_binary_op(op_name: str, dtype: torch.dtype, pt_op) -> None:
+    if not _cortex_m_float_enabled(dtype):
+        return
+
+    expected_dtype_str = "float32" if dtype == torch.float32 else "float16"
+    lib.define(
+        f"{op_name}("
+        "Tensor self, Tensor other, float activation_min, float activation_max"
+        ") -> Tensor"
+    )
+    lib.define(
+        f"{op_name}.out("
+        "Tensor self, Tensor other, float activation_min, float activation_max, "
+        "*, Tensor(a!) out) -> Tensor(a!)"
+    )
+
+    def _meta(
+        self: torch.Tensor,
+        other: torch.Tensor,
+        activation_min: float,
+        activation_max: float,
+    ) -> torch.Tensor:
+        del activation_min, activation_max
+        assert self.dtype == dtype, (
+            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
+            f"got self.dtype={self.dtype}"
+        )
+        assert other.dtype == dtype, (
+            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
+            f"got other.dtype={other.dtype}"
+        )
+        assert self.shape == other.shape or is_channel_broadcast(self, other), (
+            f"Cortex-M {op_name} currently requires same-shape tensors or "
+            f"channel broadcast, got self.shape={self.shape}, "
+            f"other.shape={other.shape}"
+        )
+        output_tensor = self if self.numel() >= other.numel() else other
+        return torch.empty_like(output_tensor)
+
+    def _impl(
+        self: torch.Tensor,
+        other: torch.Tensor,
+        activation_min: float,
+        activation_max: float,
+    ) -> torch.Tensor:
+        assert self.dtype == dtype, (
+            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
+            f"got self.dtype={self.dtype}"
+        )
+        assert other.dtype == dtype, (
+            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
+            f"got other.dtype={other.dtype}"
+        )
+        assert self.shape == other.shape or is_channel_broadcast(self, other), (
+            f"Cortex-M {op_name} currently requires same-shape tensors or "
+            f"channel broadcast, got self.shape={self.shape}, "
+            f"other.shape={other.shape}"
+        )
+        return torch.clamp(pt_op(self, other), min=activation_min, max=activation_max)
+
+    register_fake(f"cortex_m::{op_name}")(_meta)  # type: ignore[misc]
+    impl(lib, op_name, "CompositeExplicitAutograd")(_impl)  # type: ignore[misc]
+
+
+_define_float_binary_op("add_f32", torch.float32, lambda a, b: a + b)
+_define_float_binary_op("add_f16", torch.float16, lambda a, b: a + b)
+_define_float_binary_op("mul_f32", torch.float32, lambda a, b: a * b)
+_define_float_binary_op("mul_f16", torch.float16, lambda a, b: a * b)
+
+
+# -------------------------------------------------------------------
+# Quantized multiply and batched matmul operators
+# -------------------------------------------------------------------
 lib.define(
     "quantized_mul("
     "Tensor self, int self_zero_point, "
@@ -460,633 +535,6 @@ def quantized_batch_matmul_impl(
     return torch.clamp(result + output_zero_point, -128, 127).to(torch.int8)
 
 
-# ===================================================================
-# MINIMUM/MAXIMUM OPERATION DEFINITIONS
-# ===================================================================
-lib.define("minimum(Tensor self, Tensor other) -> Tensor")
-lib.define("minimum.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)")
-
-
-@register_fake("cortex_m::minimum")  # type: ignore[misc]
-def minimum_meta(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
-    # other is a scalar, so use initial shape.
-    if other.numel() == 1:
-        return torch.empty_like(self)
-    else:
-        # otherwise broadcast the shape.
-        return torch.empty(
-            torch.broadcast_shapes(self.shape, other.shape),
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-
-@impl(lib, "minimum", "CompositeExplicitAutograd")  # type: ignore[misc]
-def minimum_impl(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
-    return torch.minimum(self, other)
-
-
-lib.define("maximum(Tensor self, Tensor other) -> Tensor")
-lib.define("maximum.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)")
-
-
-@register_fake("cortex_m::maximum")  # type: ignore[misc]
-def maximum_meta(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
-    assert self.dtype == other.dtype, (
-        "Cortex-M maximum: dtype mismatch — "
-        f"got self.dtype={self.dtype}, other.dtype={other.dtype}"
-    )
-    # other is a scalar, so use initial shape.
-    if other.numel() == 1:
-        return torch.empty_like(self)
-    else:
-        # otherwise broadcast the shape.
-        return torch.empty(
-            torch.broadcast_shapes(self.shape, other.shape),
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-
-@impl(lib, "maximum", "CompositeExplicitAutograd")  # type: ignore[misc]
-def maximum_impl(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
-    return torch.maximum(self, other)
-
-
-# ===================================================================
-# QUANTIZED LINEAR OPERATION DEFINITION
-# ===================================================================
-
-lib.define(
-    "quantized_linear.out("
-    "Tensor input,  "
-    "Tensor weights, "
-    "Tensor? bias, "
-    "Tensor? kernel_sum, "
-    "int input_offset, "
-    "int filter_offset, "
-    "int output_offset, "
-    "int[] requantize_multipliers, "
-    "int[] requantize_shifts, "
-    "int activation_max, "
-    "int activation_min, "
-    "*, Tensor(a!) out"
-    ") -> Tensor(a!)"
-)
-
-# Define functional variant (non-out version)
-lib.define(
-    "quantized_linear("
-    "Tensor input,  "
-    "Tensor weights, "
-    "Tensor? bias, "
-    "Tensor? kernel_sum, "
-    "int input_offset, "
-    "int filter_offset, "
-    "int output_offset, "
-    "int[] requantize_multipliers, "
-    "int[] requantize_shifts, "
-    "int activation_max, "
-    "int activation_min"
-    ") -> Tensor"
-)
-
-
-# Fake meta function for shape inference (functional variant)
-@register_fake("cortex_m::quantized_linear")  # type: ignore[misc]
-def quantized_linear_meta(
-    input: torch.Tensor,
-    weights: torch.Tensor,
-    bias: torch.Tensor | None,
-    kernel_sum: torch.Tensor | None,
-    input_offset: int,
-    filter_offset: int,
-    output_offset: int,
-    requantize_multipliers: torch.Tensor,
-    requantize_shifts: torch.Tensor,
-    activation_max: int,
-    activation_min: int,
-) -> torch.Tensor:
-
-    shape = (*input.shape[:-1], weights.shape[0])
-    return torch.empty(shape, dtype=input.dtype, device=input.device)
-
-
-# Functional variant implementation
-@impl(lib, "quantized_linear", "CompositeExplicitAutograd")  # type: ignore[misc]
-def quantized_linear_impl(
-    input: torch.Tensor,
-    weights: torch.Tensor,
-    bias: torch.Tensor | None,
-    kernel_sum: torch.Tensor | None,
-    input_offset: int,
-    filter_offset: int,
-    output_offset: int,
-    requantize_multipliers: torch.Tensor,
-    requantize_shifts: torch.Tensor,
-    activation_max: int,
-    activation_min: int,
-) -> torch.Tensor:
-    """
-    Functional variant - creates output tensor and calls out variant
-    """
-
-    # Mirror CMSIS-NN's arm_fully_connected_s8 contract: the MVE path reads
-    # kernel_sum (ctx.buf) and ignores bias; the DSP and scalar paths read
-    # bias and ignore kernel_sum. The AOT pass populates exactly one of them
-    # based on the target ISA, so dispatch off which one is present.
-    if kernel_sum is not None:
-        weights_int32 = weights.to(torch.int32)
-
-        input_int32 = input.to(torch.int32)
-        new_shape = (prod(input.shape[:-1]), input.shape[-1])
-        input_reshaped = input_int32.reshape(new_shape)
-
-        lhs_sum = torch.sum(input_reshaped, dim=-1, keepdim=True) * filter_offset
-        output = torch.mm(input_reshaped, weights_int32.T) + lhs_sum + kernel_sum
-        output_shape = (*input.shape[:-1], output.shape[-1])
-        output_reshaped = output.reshape(output_shape)
-    else:
-        weights_int32 = weights.to(torch.int32) + filter_offset
-
-        input_int32 = input.to(torch.int32) + input_offset
-        new_shape = (prod(input.shape[:-1]), input.shape[-1])
-        input_reshaped = input_int32.reshape(new_shape)
-
-        output = torch.mm(input_reshaped, weights_int32.T)
-        if bias is not None:
-            output = output + bias
-        output_shape = (*input.shape[:-1], output.shape[-1])
-        output_reshaped = output.reshape(output_shape)
-
-    output = requantize_cmsis(
-        output_reshaped,
-        int(requantize_multipliers[0]),
-        int(requantize_shifts[0]),
-    )
-    output += output_offset
-    output = torch.clamp(output, activation_min, activation_max).to(torch.int8)
-    return output
-
-
-# ===================================================================
-# SOFTMAX OPERATION DEFINITION
-# ===================================================================
-
-lib.define(
-    "softmax(Tensor input, int dim, int input_zero_point, int output_zero_point, int input_multiplier, int input_shift, int diff_min) -> Tensor"
-)
-lib.define(
-    "softmax.out(Tensor input, int dim, int input_zero_point, int output_zero_point, int input_multiplier, int input_shift, int diff_min, *, Tensor(a!) out) -> Tensor(a!)"
-)
-
-
-@register_fake("cortex_m::softmax")  # type: ignore[misc]
-def softmax_meta(
-    input: torch.Tensor,
-    dim: int,
-    input_zero_point: int,
-    output_zero_point: int,
-    input_multiplier: int,
-    input_shift: int,
-    diff_min: int,
-) -> torch.Tensor:
-    return torch.empty_like(input, dtype=torch.int8)
-
-
-@impl(lib, "softmax", "CompositeExplicitAutograd")  # type: ignore[misc]
-def softmax_impl(
-    input: torch.Tensor,
-    dim: int,
-    input_zero_point: int,
-    output_zero_point: int,
-    input_multiplier: int,
-    input_shift: int,
-    diff_min: int,
-) -> torch.Tensor:
-    del diff_min  # not used in reference path
-    if input.dtype != torch.int8:
-        raise TypeError(
-            f"cortex_m.softmax: expected int8 input tensor, got {input.dtype}"
-        )
-    if output_zero_point != CMSIS_SOFTMAX_ZERO_POINT:
-        raise ValueError(
-            f"cortex_m.softmax: expected output_zero_point {CMSIS_SOFTMAX_ZERO_POINT}, got {output_zero_point}"
-        )
-
-    real_multiplier = float(input_multiplier) / float(1 << 31)
-    real_multiplier = math.ldexp(real_multiplier, input_shift)
-    input_scale = real_multiplier / float(1 << (31 - SOFTMAX_INPUT_INTEGER_BITS))
-    if input_scale <= 0:
-        raise ValueError(
-            f"cortex_m.softmax: derived non-positive input scale {input_scale}"
-        )
-
-    input_fp = (input.to(torch.int32) - int(input_zero_point)).float() * input_scale
-    probs = torch.softmax(input_fp, dim=dim)
-    quantized = torch.round(probs / CMSIS_SOFTMAX_SCALE) + int(output_zero_point)
-    return quantized.clamp(-128, 127).to(torch.int8)
-
-
-# ===================================================================
-# TRANSPOSE OPERATION DEFINITION
-# ===================================================================
-lib.define("transpose(Tensor input, int[] perm) -> Tensor")
-lib.define("transpose.out(Tensor input, int[] perm, *, Tensor(a!) out) -> Tensor(a!)")
-
-
-@register_fake("cortex_m::transpose")  # type: ignore[misc]
-def transpose_meta(input: torch.Tensor, perm: Sequence[int]) -> torch.Tensor:
-    output_shape = [input.shape[idx] for idx in perm]
-    return torch.empty(output_shape, dtype=input.dtype, device=input.device)
-
-
-@impl(lib, "transpose", "CompositeExplicitAutograd")  # type: ignore[misc]
-def transpose_impl(input: torch.Tensor, perm: Sequence[int]) -> torch.Tensor:
-    return input.permute(tuple(perm)).contiguous()
-
-
-# ===================================================================
-# PAD OPERATION DEFINITION
-# ===================================================================
-lib.define("pad(Tensor input, int[] pre_pad, int[] post_pad, int pad_value) -> Tensor")
-lib.define(
-    "pad.out(Tensor input, int[] pre_pad, int[] post_pad, int pad_value, "
-    "*, Tensor(a!) out) -> Tensor(a!)"
-)
-
-
-_NHWC_INV_ORDER = [0, 3, 1, 2]
-
-
-def _pad_to_logical_order(physical_pad: list[int], input: torch.Tensor) -> list[int]:
-    """Inverse of _to_physical_order: map physical-order padding back to logical."""
-    if not is_channels_last(input):
-        return list(physical_pad)
-    return [physical_pad[_NHWC_INV_ORDER[i]] for i in range(4)]
-
-
-@register_fake("cortex_m::pad")  # type: ignore[misc]
-def pad_meta(
-    input: torch.Tensor,
-    pre_pad: list[int],
-    post_pad: list[int],
-    pad_value: int,
-) -> torch.Tensor:
-    rank = input.dim()
-    offset = 4 - rank
-    logical_pre = _pad_to_logical_order(pre_pad, input)
-    logical_post = _pad_to_logical_order(post_pad, input)
-
-    output_shape = list(input.shape)
-    for i in range(rank):
-        output_shape[i] += logical_pre[offset + i] + logical_post[offset + i]
-    result = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-    if is_channels_last(input):
-        result = result.to(memory_format=torch.channels_last)
-    return result
-
-
-@impl(lib, "pad", "CompositeExplicitAutograd")  # type: ignore[misc]
-def pad_impl(
-    input: torch.Tensor,
-    pre_pad: list[int],
-    post_pad: list[int],
-    pad_value: int,
-) -> torch.Tensor:
-    rank = input.dim()
-    offset = 4 - rank
-    logical_pre = _pad_to_logical_order(pre_pad, input)
-    logical_post = _pad_to_logical_order(post_pad, input)
-
-    padding = []
-    for i in reversed(range(rank)):
-        padding.extend([logical_pre[offset + i], logical_post[offset + i]])
-    return F.pad(input, padding, mode="constant", value=pad_value)
-
-
-# ===================================================================
-# QUANTIZED CONV2D OPERATION DEFINITION
-# ===================================================================
-
-lib.define(
-    "quantized_conv2d("
-    "Tensor input, "
-    "Tensor weight, "
-    "Tensor? bias, "
-    "int[] stride, "
-    "int[] padding, "
-    "int[] dilation, "
-    "int input_offset, "
-    "int output_offset, "
-    "Tensor requantize_multipliers, "
-    "Tensor requantize_shifts, "
-    "int activation_min, "
-    "int activation_max, "
-    "Tensor scratch"
-    ") -> Tensor"
-)
-
-
-lib.define(
-    "quantized_conv2d.out("
-    "Tensor input, "
-    "Tensor weight, "
-    "Tensor? bias, "
-    "int[] stride, "
-    "int[] padding, "
-    "int[] dilation, "
-    "int input_offset, "
-    "int output_offset, "
-    "Tensor requantize_multipliers, "
-    "Tensor requantize_shifts, "
-    "int activation_min, "
-    "int activation_max, "
-    "Tensor scratch, "
-    "*, Tensor(a!) out"
-    ") -> Tensor(a!)"
-)
-
-
-def _compute_conv2d_output_shape(
-    input_shape: torch.Size,
-    weight_shape: torch.Size,
-    stride: Sequence[int],
-    padding: Sequence[int],
-    dilation: Sequence[int],
-) -> torch.Size:
-    batch = input_shape[0]
-    in_height = input_shape[2]
-    in_width = input_shape[3]
-    # We store the weights in OHWI layout (out, kernel_h, kernel_w, in)
-    kernel_height = weight_shape[1]
-    kernel_width = weight_shape[2]
-
-    stride_h, stride_w = stride
-    pad_h, pad_w = padding
-    dilation_h, dilation_w = dilation
-
-    out_channels = weight_shape[0]
-    out_height = (
-        in_height + 2 * pad_h - dilation_h * (kernel_height - 1) - 1
-    ) // stride_h + 1
-    out_width = (
-        in_width + 2 * pad_w - dilation_w * (kernel_width - 1) - 1
-    ) // stride_w + 1
-    return torch.Size([batch, out_channels, out_height, out_width])
-
-
-def _compute_depthwise_conv2d_output_shape(
-    input_shape: torch.Size,
-    weight_shape: torch.Size,
-    stride: Sequence[int],
-    padding: Sequence[int],
-    dilation: Sequence[int],
-) -> torch.Size:
-    batch = input_shape[0]
-    in_height = input_shape[2]
-    in_width = input_shape[3]
-    # For depthwise conv, we store the weights in IHWO layout (1, kernel_h, kernel_w, out)
-    # where dimension 3 contains the output channels
-    kernel_height = weight_shape[1]
-    kernel_width = weight_shape[2]
-
-    stride_h, stride_w = stride
-    pad_h, pad_w = padding
-    dilation_h, dilation_w = dilation
-
-    out_channels = weight_shape[3]  # IHWO format: output channels at dimension 3
-    out_height = (
-        in_height + 2 * pad_h - dilation_h * (kernel_height - 1) - 1
-    ) // stride_h + 1
-    out_width = (
-        in_width + 2 * pad_w - dilation_w * (kernel_width - 1) - 1
-    ) // stride_w + 1
-    return torch.Size([batch, out_channels, out_height, out_width])
-
-
-@register_fake("cortex_m::quantized_conv2d")  # type: ignore[misc]
-def quantized_conv2d_meta(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    stride: Sequence[int],
-    padding: Sequence[int],
-    dilation: Sequence[int],
-    input_offset: int,
-    output_offset: int,
-    requantize_multipliers: torch.Tensor,
-    requantize_shifts: torch.Tensor,
-    activation_min: int,
-    activation_max: int,
-    scratch: torch.Tensor,
-) -> torch.Tensor:
-    stride_vals = list(stride)
-    padding_vals = list(padding)
-    dilation_vals = list(dilation)
-    output_shape = _compute_conv2d_output_shape(
-        input.shape, weight.shape, stride_vals, padding_vals, dilation_vals
-    )
-    return torch.empty(
-        output_shape,
-        dtype=torch.int8,
-        device=input.device,
-        memory_format=torch.channels_last,
-    )
-
-
-@impl(lib, "quantized_conv2d", "CompositeExplicitAutograd")  # type: ignore[misc]
-def quantized_conv2d_impl(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    stride: Sequence[int],
-    padding: Sequence[int],
-    dilation: Sequence[int],
-    input_offset: int,
-    output_offset: int,
-    requantize_multipliers: torch.Tensor,
-    requantize_shifts: torch.Tensor,
-    activation_min: int,
-    activation_max: int,
-    scratch: torch.Tensor,
-) -> torch.Tensor:
-    if input.dim() != 4 or weight.dim() != 4:
-        raise RuntimeError("quantized_conv2d expects 4D input and weight tensors")
-    # Convert to int32 for accumulation and apply offsets
-    input_int32 = input.to(torch.int32) + int(input_offset)
-    weight_int32 = weight.to(torch.int32)
-
-    if bias is None:
-        bias_int32 = torch.zeros(
-            weight.shape[0], dtype=torch.int32, device=input.device
-        )
-    else:
-        bias_int32 = bias.to(torch.int32)
-
-    input_channels = input.shape[1]
-    kernel_input_channels = weight.shape[3]
-    groups = input_channels // kernel_input_channels
-
-    # Convert weights back to OIHW layout expected by torch.nn.functional.conv2d
-    weight_oi_hw = weight_int32.permute(0, 3, 1, 2).contiguous()
-
-    conv_acc = F.conv2d(
-        input_int32,
-        weight_oi_hw,
-        bias_int32,
-        stride=tuple(stride),
-        padding=tuple(padding),
-        dilation=tuple(dilation),
-        groups=groups,
-    )
-
-    result_channels = []
-    for output_channel_i in range(conv_acc.shape[1]):
-        result_channel = requantize_cmsis(
-            conv_acc[:, output_channel_i, :, :],
-            int(requantize_multipliers[output_channel_i]),
-            int(requantize_shifts[output_channel_i]),
-        )
-        result_channels.append(result_channel)
-
-    result = torch.stack(result_channels, dim=1)
-
-    result += output_offset
-    result = torch.clamp(result, activation_min, activation_max)
-
-    # TODO - this enforces all convolution layers to result in channels last.
-    # This issue does comes min/mul layers from decomposition of hard swish
-    return result.to(torch.int8, memory_format=torch.channels_last)
-
-
-lib.define(
-    "quantized_conv2d_nhwc("
-    "Tensor input, Tensor weight, Tensor? bias, int[] stride, int[] padding, "
-    "int[] dilation, int input_offset, int output_offset, "
-    "Tensor requantize_multipliers, Tensor requantize_shifts, "
-    "int activation_min, int activation_max, Tensor scratch) -> Tensor"
-)
-lib.define(
-    "quantized_conv2d_nhwc.out("
-    "Tensor input, Tensor weight, Tensor? bias, int[] stride, int[] padding, "
-    "int[] dilation, int input_offset, int output_offset, "
-    "Tensor requantize_multipliers, Tensor requantize_shifts, "
-    "int activation_min, int activation_max, Tensor scratch, "
-    "*, Tensor(a!) out) -> Tensor(a!)"
-)
-
-
-@register_fake("cortex_m::quantized_conv2d_nhwc")  # type: ignore[misc]
-@experimental(_EXPLICIT_LAYOUT_EXPERIMENTAL)  # type: ignore[misc]
-def quantized_conv2d_nhwc_meta(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    stride: Sequence[int],
-    padding: Sequence[int],
-    dilation: Sequence[int],
-    input_offset: int,
-    output_offset: int,
-    requantize_multipliers: torch.Tensor,
-    requantize_shifts: torch.Tensor,
-    activation_min: int,
-    activation_max: int,
-    scratch: torch.Tensor,
-) -> torch.Tensor:
-    nchw = quantized_conv2d_meta(
-        input.permute(0, 3, 1, 2),
-        weight,
-        bias,
-        stride,
-        padding,
-        dilation,
-        input_offset,
-        output_offset,
-        requantize_multipliers,
-        requantize_shifts,
-        activation_min,
-        activation_max,
-        scratch,
-    )
-    return nchw.permute(0, 2, 3, 1).contiguous()
-
-
-# -------------------------------------------------------------------
-# Float arithmetic operators
-# -------------------------------------------------------------------
-
-
-def _define_float_binary_op(op_name: str, dtype: torch.dtype, pt_op) -> None:
-    if not _cortex_m_float_enabled(dtype):
-        return
-
-    expected_dtype_str = "float32" if dtype == torch.float32 else "float16"
-    lib.define(
-        f"{op_name}("
-        "Tensor self, Tensor other, float activation_min, float activation_max"
-        ") -> Tensor"
-    )
-    lib.define(
-        f"{op_name}.out("
-        "Tensor self, Tensor other, float activation_min, float activation_max, "
-        "*, Tensor(a!) out) -> Tensor(a!)"
-    )
-
-    def _meta(
-        self: torch.Tensor,
-        other: torch.Tensor,
-        activation_min: float,
-        activation_max: float,
-    ) -> torch.Tensor:
-        del activation_min, activation_max
-        assert self.dtype == dtype, (
-            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
-            f"got self.dtype={self.dtype}"
-        )
-        assert other.dtype == dtype, (
-            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
-            f"got other.dtype={other.dtype}"
-        )
-        assert self.shape == other.shape or is_channel_broadcast(self, other), (
-            f"Cortex-M {op_name} currently requires same-shape tensors or "
-            f"channel broadcast, got self.shape={self.shape}, "
-            f"other.shape={other.shape}"
-        )
-        output_tensor = self if self.numel() >= other.numel() else other
-        return torch.empty_like(output_tensor)
-
-    def _impl(
-        self: torch.Tensor,
-        other: torch.Tensor,
-        activation_min: float,
-        activation_max: float,
-    ) -> torch.Tensor:
-        assert self.dtype == dtype, (
-            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
-            f"got self.dtype={self.dtype}"
-        )
-        assert other.dtype == dtype, (
-            f"Cortex-M {op_name} expects {expected_dtype_str} inputs, "
-            f"got other.dtype={other.dtype}"
-        )
-        assert self.shape == other.shape or is_channel_broadcast(self, other), (
-            f"Cortex-M {op_name} currently requires same-shape tensors or "
-            f"channel broadcast, got self.shape={self.shape}, "
-            f"other.shape={other.shape}"
-        )
-        return torch.clamp(pt_op(self, other), min=activation_min, max=activation_max)
-
-    register_fake(f"cortex_m::{op_name}")(_meta)  # type: ignore[misc]
-    impl(lib, op_name, "CompositeExplicitAutograd")(_impl)  # type: ignore[misc]
-
-
-_define_float_binary_op("add_f32", torch.float32, lambda a, b: a + b)
-_define_float_binary_op("add_f16", torch.float16, lambda a, b: a + b)
-_define_float_binary_op("mul_f32", torch.float32, lambda a, b: a * b)
-_define_float_binary_op("mul_f16", torch.float16, lambda a, b: a * b)
-
-
 # -------------------------------------------------------------------
 # Float batched matmul operators
 # -------------------------------------------------------------------
@@ -1248,6 +696,175 @@ def batch_matmul_f16_impl(
     return _float_batch_matmul_impl(
         lhs, rhs_transposed, rhs_is_packed, rhs_cols, activation_min, activation_max
     )
+
+
+# -------------------------------------------------------------------
+# Common min/max operators
+# -------------------------------------------------------------------
+lib.define("minimum(Tensor self, Tensor other) -> Tensor")
+lib.define("minimum.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)")
+
+
+@register_fake("cortex_m::minimum")  # type: ignore[misc]
+def minimum_meta(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+    # other is a scalar, so use initial shape.
+    if other.numel() == 1:
+        return torch.empty_like(self)
+    else:
+        # otherwise broadcast the shape.
+        return torch.empty(
+            torch.broadcast_shapes(self.shape, other.shape),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+
+@impl(lib, "minimum", "CompositeExplicitAutograd")  # type: ignore[misc]
+def minimum_impl(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+    return torch.minimum(self, other)
+
+
+lib.define("maximum(Tensor self, Tensor other) -> Tensor")
+lib.define("maximum.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)")
+
+
+@register_fake("cortex_m::maximum")  # type: ignore[misc]
+def maximum_meta(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+    assert self.dtype == other.dtype, (
+        "Cortex-M maximum: dtype mismatch — "
+        f"got self.dtype={self.dtype}, other.dtype={other.dtype}"
+    )
+    # other is a scalar, so use initial shape.
+    if other.numel() == 1:
+        return torch.empty_like(self)
+    else:
+        # otherwise broadcast the shape.
+        return torch.empty(
+            torch.broadcast_shapes(self.shape, other.shape),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+
+@impl(lib, "maximum", "CompositeExplicitAutograd")  # type: ignore[misc]
+def maximum_impl(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+    return torch.maximum(self, other)
+
+
+# -------------------------------------------------------------------
+# Quantized linear operators
+# -------------------------------------------------------------------
+
+lib.define(
+    "quantized_linear.out("
+    "Tensor input,  "
+    "Tensor weights, "
+    "Tensor? bias, "
+    "Tensor? kernel_sum, "
+    "int input_offset, "
+    "int filter_offset, "
+    "int output_offset, "
+    "int[] requantize_multipliers, "
+    "int[] requantize_shifts, "
+    "int activation_max, "
+    "int activation_min, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+# Define functional variant (non-out version)
+lib.define(
+    "quantized_linear("
+    "Tensor input,  "
+    "Tensor weights, "
+    "Tensor? bias, "
+    "Tensor? kernel_sum, "
+    "int input_offset, "
+    "int filter_offset, "
+    "int output_offset, "
+    "int[] requantize_multipliers, "
+    "int[] requantize_shifts, "
+    "int activation_max, "
+    "int activation_min"
+    ") -> Tensor"
+)
+
+
+# Fake meta function for shape inference (functional variant)
+@register_fake("cortex_m::quantized_linear")  # type: ignore[misc]
+def quantized_linear_meta(
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    bias: torch.Tensor | None,
+    kernel_sum: torch.Tensor | None,
+    input_offset: int,
+    filter_offset: int,
+    output_offset: int,
+    requantize_multipliers: torch.Tensor,
+    requantize_shifts: torch.Tensor,
+    activation_max: int,
+    activation_min: int,
+) -> torch.Tensor:
+
+    shape = (*input.shape[:-1], weights.shape[0])
+    return torch.empty(shape, dtype=input.dtype, device=input.device)
+
+
+# Functional variant implementation
+@impl(lib, "quantized_linear", "CompositeExplicitAutograd")  # type: ignore[misc]
+def quantized_linear_impl(
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    bias: torch.Tensor | None,
+    kernel_sum: torch.Tensor | None,
+    input_offset: int,
+    filter_offset: int,
+    output_offset: int,
+    requantize_multipliers: torch.Tensor,
+    requantize_shifts: torch.Tensor,
+    activation_max: int,
+    activation_min: int,
+) -> torch.Tensor:
+    """
+    Functional variant - creates output tensor and calls out variant
+    """
+
+    # Mirror CMSIS-NN's arm_fully_connected_s8 contract: the MVE path reads
+    # kernel_sum (ctx.buf) and ignores bias; the DSP and scalar paths read
+    # bias and ignore kernel_sum. The AOT pass populates exactly one of them
+    # based on the target ISA, so dispatch off which one is present.
+    if kernel_sum is not None:
+        weights_int32 = weights.to(torch.int32)
+
+        input_int32 = input.to(torch.int32)
+        new_shape = (prod(input.shape[:-1]), input.shape[-1])
+        input_reshaped = input_int32.reshape(new_shape)
+
+        lhs_sum = torch.sum(input_reshaped, dim=-1, keepdim=True) * filter_offset
+        output = torch.mm(input_reshaped, weights_int32.T) + lhs_sum + kernel_sum
+        output_shape = (*input.shape[:-1], output.shape[-1])
+        output_reshaped = output.reshape(output_shape)
+    else:
+        weights_int32 = weights.to(torch.int32) + filter_offset
+
+        input_int32 = input.to(torch.int32) + input_offset
+        new_shape = (prod(input.shape[:-1]), input.shape[-1])
+        input_reshaped = input_int32.reshape(new_shape)
+
+        output = torch.mm(input_reshaped, weights_int32.T)
+        if bias is not None:
+            output = output + bias
+        output_shape = (*input.shape[:-1], output.shape[-1])
+        output_reshaped = output.reshape(output_shape)
+
+    output = requantize_cmsis(
+        output_reshaped,
+        int(requantize_multipliers[0]),
+        int(requantize_shifts[0]),
+    )
+    output += output_offset
+    output = torch.clamp(output, activation_min, activation_max).to(torch.int8)
+    return output
 
 
 lib.define(
@@ -1906,6 +1523,61 @@ def lstm_unidirectional_f16_impl(
 # ===================================================================
 # SOFTMAX OPERATION DEFINITION
 # ===================================================================
+
+lib.define(
+    "softmax(Tensor input, int dim, int input_zero_point, int output_zero_point, int input_multiplier, int input_shift, int diff_min) -> Tensor"
+)
+lib.define(
+    "softmax.out(Tensor input, int dim, int input_zero_point, int output_zero_point, int input_multiplier, int input_shift, int diff_min, *, Tensor(a!) out) -> Tensor(a!)"
+)
+
+
+@register_fake("cortex_m::softmax")  # type: ignore[misc]
+def softmax_meta(
+    input: torch.Tensor,
+    dim: int,
+    input_zero_point: int,
+    output_zero_point: int,
+    input_multiplier: int,
+    input_shift: int,
+    diff_min: int,
+) -> torch.Tensor:
+    return torch.empty_like(input, dtype=torch.int8)
+
+
+@impl(lib, "softmax", "CompositeExplicitAutograd")  # type: ignore[misc]
+def softmax_impl(
+    input: torch.Tensor,
+    dim: int,
+    input_zero_point: int,
+    output_zero_point: int,
+    input_multiplier: int,
+    input_shift: int,
+    diff_min: int,
+) -> torch.Tensor:
+    del diff_min  # not used in reference path
+    if input.dtype != torch.int8:
+        raise TypeError(
+            f"cortex_m.softmax: expected int8 input tensor, got {input.dtype}"
+        )
+    if output_zero_point != CMSIS_SOFTMAX_ZERO_POINT:
+        raise ValueError(
+            f"cortex_m.softmax: expected output_zero_point {CMSIS_SOFTMAX_ZERO_POINT}, got {output_zero_point}"
+        )
+
+    real_multiplier = float(input_multiplier) / float(1 << 31)
+    real_multiplier = math.ldexp(real_multiplier, input_shift)
+    input_scale = real_multiplier / float(1 << (31 - SOFTMAX_INPUT_INTEGER_BITS))
+    if input_scale <= 0:
+        raise ValueError(
+            f"cortex_m.softmax: derived non-positive input scale {input_scale}"
+        )
+
+    input_fp = (input.to(torch.int32) - int(input_zero_point)).float() * input_scale
+    probs = torch.softmax(input_fp, dim=dim)
+    quantized = torch.round(probs / CMSIS_SOFTMAX_SCALE) + int(output_zero_point)
+    return quantized.clamp(-128, 127).to(torch.int8)
+
 
 lib.define("softmax_f32(Tensor input, int dim) -> Tensor")
 lib.define("softmax_f32.out(Tensor input, int dim, *, Tensor(a!) out) -> Tensor(a!)")
@@ -2566,6 +2238,29 @@ def svdf_f16_impl(
 # ===================================================================
 # TRANSPOSE OPERATION DEFINITION
 # ===================================================================
+lib.define("transpose(Tensor input, int[] perm) -> Tensor")
+lib.define("transpose.out(Tensor input, int[] perm, *, Tensor(a!) out) -> Tensor(a!)")
+
+
+@register_fake("cortex_m::transpose")  # type: ignore[misc]
+def transpose_meta(input: torch.Tensor, perm: Sequence[int]) -> torch.Tensor:
+    output_shape = [input.shape[idx] for idx in perm]
+    return torch.empty(output_shape, dtype=input.dtype, device=input.device)
+
+
+@impl(lib, "transpose", "CompositeExplicitAutograd")  # type: ignore[misc]
+def transpose_impl(input: torch.Tensor, perm: Sequence[int]) -> torch.Tensor:
+    return input.permute(tuple(perm)).contiguous()
+
+
+# ===================================================================
+# PAD OPERATION DEFINITION
+# ===================================================================
+lib.define("pad(Tensor input, int[] pre_pad, int[] post_pad, int pad_value) -> Tensor")
+lib.define(
+    "pad.out(Tensor input, int[] pre_pad, int[] post_pad, int pad_value, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
 lib.define(
     "pad_f32(Tensor input, int[] pre_pad, int[] post_pad, float pad_value) -> Tensor"
 )
@@ -2582,6 +2277,55 @@ lib.define(
 )
 
 
+_NHWC_INV_ORDER = [0, 3, 1, 2]
+
+
+def _pad_to_logical_order(physical_pad: list[int], input: torch.Tensor) -> list[int]:
+    """Inverse of _to_physical_order: map physical-order padding back to logical."""
+    if not is_channels_last(input):
+        return list(physical_pad)
+    return [physical_pad[_NHWC_INV_ORDER[i]] for i in range(4)]
+
+
+@register_fake("cortex_m::pad")  # type: ignore[misc]
+def pad_meta(
+    input: torch.Tensor,
+    pre_pad: list[int],
+    post_pad: list[int],
+    pad_value: int,
+) -> torch.Tensor:
+    rank = input.dim()
+    offset = 4 - rank
+    logical_pre = _pad_to_logical_order(pre_pad, input)
+    logical_post = _pad_to_logical_order(post_pad, input)
+
+    output_shape = list(input.shape)
+    for i in range(rank):
+        output_shape[i] += logical_pre[offset + i] + logical_post[offset + i]
+    result = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+    if is_channels_last(input):
+        result = result.to(memory_format=torch.channels_last)
+    return result
+
+
+@impl(lib, "pad", "CompositeExplicitAutograd")  # type: ignore[misc]
+def pad_impl(
+    input: torch.Tensor,
+    pre_pad: list[int],
+    post_pad: list[int],
+    pad_value: int,
+) -> torch.Tensor:
+    rank = input.dim()
+    offset = 4 - rank
+    logical_pre = _pad_to_logical_order(pre_pad, input)
+    logical_post = _pad_to_logical_order(post_pad, input)
+
+    padding = []
+    for i in reversed(range(rank)):
+        padding.extend([logical_pre[offset + i], logical_post[offset + i]])
+    return F.pad(input, padding, mode="constant", value=pad_value)
+
+
 def _pad_meta_float(
     input: torch.Tensor,
     pre_pad: list[int],
@@ -2591,7 +2335,6 @@ def _pad_meta_float(
     offset = 4 - rank
     logical_pre = _pad_to_logical_order(pre_pad, input)
     logical_post = _pad_to_logical_order(post_pad, input)
-
     output_shape = list(input.shape)
     for i in range(rank):
         output_shape[i] += logical_pre[offset + i] + logical_post[offset + i]
@@ -2611,7 +2354,6 @@ def _pad_impl_float(
     offset = 4 - rank
     logical_pre = _pad_to_logical_order(pre_pad, input)
     logical_post = _pad_to_logical_order(post_pad, input)
-
     padding = []
     for i in reversed(range(rank)):
         padding.extend([logical_pre[offset + i], logical_post[offset + i]])
@@ -2671,81 +2413,152 @@ def pad_f16_impl(
 # ===================================================================
 # FLOAT / QUANTIZED CONV2D OPERATION DEFINITION
 # ===================================================================
-# Packed float conv weights follow the same idea as packed linear/BMM weights:
-# the tensor becomes a flat kernel buffer and the original [O, KH, KW, I]
-# shape is carried explicitly through packed_* metadata.
+# Packed float conv weights are flat buffers; packed_* arguments preserve the
+# original [O, KH, KW, I] dimensions needed by fake kernels and runtime code.
 
 lib.define(
-    "conv2d_f32("
-    "Tensor input, "
-    "Tensor weight, "
-    "Tensor? bias, "
-    "int[] stride, "
-    "int[] padding, "
-    "int[] dilation, "
-    "bool weight_is_packed, "
-    "int packed_output_channels, "
-    "int packed_kernel_height, "
-    "int packed_kernel_width, "
-    "int packed_kernel_input_channels, "
-    "float activation_min, "
-    "float activation_max"
-    ") -> Tensor"
+    "conv2d_f32(Tensor input, Tensor weight, Tensor? bias, int[] stride, "
+    "int[] padding, int[] dilation, bool weight_is_packed, "
+    "int packed_output_channels, int packed_kernel_height, "
+    "int packed_kernel_width, int packed_kernel_input_channels, "
+    "float activation_min, float activation_max) -> Tensor"
 )
 lib.define(
-    "conv2d_f32.out("
+    "conv2d_f32.out(Tensor input, Tensor weight, Tensor? bias, int[] stride, "
+    "int[] padding, int[] dilation, bool weight_is_packed, "
+    "int packed_output_channels, int packed_kernel_height, "
+    "int packed_kernel_width, int packed_kernel_input_channels, "
+    "float activation_min, float activation_max, *, Tensor(a!) out) -> Tensor(a!)"
+)
+lib.define(
+    "conv2d_f16(Tensor input, Tensor weight, Tensor? bias, int[] stride, "
+    "int[] padding, int[] dilation, bool weight_is_packed, "
+    "int packed_output_channels, int packed_kernel_height, "
+    "int packed_kernel_width, int packed_kernel_input_channels, "
+    "float activation_min, float activation_max) -> Tensor"
+)
+lib.define(
+    "conv2d_f16.out(Tensor input, Tensor weight, Tensor? bias, int[] stride, "
+    "int[] padding, int[] dilation, bool weight_is_packed, "
+    "int packed_output_channels, int packed_kernel_height, "
+    "int packed_kernel_width, int packed_kernel_input_channels, "
+    "float activation_min, float activation_max, *, Tensor(a!) out) -> Tensor(a!)"
+)
+lib.define(
+    "depthwise_conv2d_f32(Tensor input, Tensor weight, Tensor? bias, "
+    "int[] stride, int[] padding, int[] dilation, int depth_multiplier, "
+    "float activation_min, float activation_max) -> Tensor"
+)
+lib.define(
+    "depthwise_conv2d_f32.out(Tensor input, Tensor weight, Tensor? bias, "
+    "int[] stride, int[] padding, int[] dilation, int depth_multiplier, "
+    "float activation_min, float activation_max, *, Tensor(a!) out) -> Tensor(a!)"
+)
+lib.define(
+    "depthwise_conv2d_f16(Tensor input, Tensor weight, Tensor? bias, "
+    "int[] stride, int[] padding, int[] dilation, int depth_multiplier, "
+    "float activation_min, float activation_max) -> Tensor"
+)
+lib.define(
+    "depthwise_conv2d_f16.out(Tensor input, Tensor weight, Tensor? bias, "
+    "int[] stride, int[] padding, int[] dilation, int depth_multiplier, "
+    "float activation_min, float activation_max, *, Tensor(a!) out) -> Tensor(a!)"
+)
+
+lib.define(
+    "quantized_conv2d("
     "Tensor input, "
     "Tensor weight, "
     "Tensor? bias, "
     "int[] stride, "
     "int[] padding, "
     "int[] dilation, "
-    "bool weight_is_packed, "
-    "int packed_output_channels, "
-    "int packed_kernel_height, "
-    "int packed_kernel_width, "
-    "int packed_kernel_input_channels, "
-    "float activation_min, "
-    "float activation_max, "
+    "int input_offset, "
+    "int output_offset, "
+    "Tensor requantize_multipliers, "
+    "Tensor requantize_shifts, "
+    "int activation_min, "
+    "int activation_max, "
+    "Tensor scratch"
+    ") -> Tensor"
+)
+
+
+lib.define(
+    "quantized_conv2d.out("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] dilation, "
+    "int input_offset, "
+    "int output_offset, "
+    "Tensor requantize_multipliers, "
+    "Tensor requantize_shifts, "
+    "int activation_min, "
+    "int activation_max, "
+    "Tensor scratch, "
     "*, Tensor(a!) out"
     ") -> Tensor(a!)"
 )
 
-lib.define(
-    "conv2d_f16("
-    "Tensor input, "
-    "Tensor weight, "
-    "Tensor? bias, "
-    "int[] stride, "
-    "int[] padding, "
-    "int[] dilation, "
-    "bool weight_is_packed, "
-    "int packed_output_channels, "
-    "int packed_kernel_height, "
-    "int packed_kernel_width, "
-    "int packed_kernel_input_channels, "
-    "float activation_min, "
-    "float activation_max"
-    ") -> Tensor"
-)
-lib.define(
-    "conv2d_f16.out("
-    "Tensor input, "
-    "Tensor weight, "
-    "Tensor? bias, "
-    "int[] stride, "
-    "int[] padding, "
-    "int[] dilation, "
-    "bool weight_is_packed, "
-    "int packed_output_channels, "
-    "int packed_kernel_height, "
-    "int packed_kernel_width, "
-    "int packed_kernel_input_channels, "
-    "float activation_min, "
-    "float activation_max, "
-    "*, Tensor(a!) out"
-    ") -> Tensor(a!)"
-)
+
+def _compute_conv2d_output_shape(
+    input_shape: torch.Size,
+    weight_shape: torch.Size,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+) -> torch.Size:
+    batch = input_shape[0]
+    in_height = input_shape[2]
+    in_width = input_shape[3]
+    # We store the weights in OHWI layout (out, kernel_h, kernel_w, in)
+    kernel_height = weight_shape[1]
+    kernel_width = weight_shape[2]
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dilation_h, dilation_w = dilation
+
+    out_channels = weight_shape[0]
+    out_height = (
+        in_height + 2 * pad_h - dilation_h * (kernel_height - 1) - 1
+    ) // stride_h + 1
+    out_width = (
+        in_width + 2 * pad_w - dilation_w * (kernel_width - 1) - 1
+    ) // stride_w + 1
+    return torch.Size([batch, out_channels, out_height, out_width])
+
+
+def _compute_depthwise_conv2d_output_shape(
+    input_shape: torch.Size,
+    weight_shape: torch.Size,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+) -> torch.Size:
+    batch = input_shape[0]
+    in_height = input_shape[2]
+    in_width = input_shape[3]
+    # For depthwise conv, we store the weights in IHWO layout (1, kernel_h, kernel_w, out)
+    # where dimension 3 contains the output channels
+    kernel_height = weight_shape[1]
+    kernel_width = weight_shape[2]
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dilation_h, dilation_w = dilation
+
+    out_channels = weight_shape[3]  # IHWO format: output channels at dimension 3
+    out_height = (
+        in_height + 2 * pad_h - dilation_h * (kernel_height - 1) - 1
+    ) // stride_h + 1
+    out_width = (
+        in_width + 2 * pad_w - dilation_w * (kernel_width - 1) - 1
+    ) // stride_w + 1
+    return torch.Size([batch, out_channels, out_height, out_width])
 
 
 def _float_conv2d_meta_impl(
@@ -3219,521 +3032,153 @@ def depthwise_conv2d_f16_impl(
     )
 
 
-lib.define(
-    "transpose_conv2d_f32("
-    "Tensor input, "
-    "Tensor weight, "
-    "Tensor? bias, "
-    "int[] stride, "
-    "int[] padding, "
-    "int[] output_padding, "
-    "int[] dilation, "
-    "float activation_min, "
-    "float activation_max"
-    ") -> Tensor"
-)
-
-lib.define(
-    "transpose_conv2d_f32.out("
-    "Tensor input, "
-    "Tensor weight, "
-    "Tensor? bias, "
-    "int[] stride, "
-    "int[] padding, "
-    "int[] output_padding, "
-    "int[] dilation, "
-    "float activation_min, "
-    "float activation_max, "
-    "*, Tensor(a!) out) -> Tensor(a!)"
-)
-
-lib.define(
-    "transpose_conv2d_f16("
-    "Tensor input, "
-    "Tensor weight, "
-    "Tensor? bias, "
-    "int[] stride, "
-    "int[] padding, "
-    "int[] output_padding, "
-    "int[] dilation, "
-    "float activation_min, "
-    "float activation_max"
-    ") -> Tensor"
-)
-
-lib.define(
-    "transpose_conv2d_f16.out("
-    "Tensor input, "
-    "Tensor weight, "
-    "Tensor? bias, "
-    "int[] stride, "
-    "int[] padding, "
-    "int[] output_padding, "
-    "int[] dilation, "
-    "float activation_min, "
-    "float activation_max, "
-    "*, Tensor(a!) out) -> Tensor(a!)"
-)
-
-
-def _transpose_conv2d_float_meta_impl(
+@register_fake("cortex_m::quantized_conv2d")  # type: ignore[misc]
+def quantized_conv2d_meta(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     stride: Sequence[int],
     padding: Sequence[int],
-    output_padding: Sequence[int],
     dilation: Sequence[int],
-    expected_dtype: torch.dtype,
+    input_offset: int,
+    output_offset: int,
+    requantize_multipliers: torch.Tensor,
+    requantize_shifts: torch.Tensor,
+    activation_min: int,
+    activation_max: int,
+    scratch: torch.Tensor,
 ) -> torch.Tensor:
-    assert (
-        input.dtype == expected_dtype
-    ), f"Cortex-M float transpose_conv2d expects input dtype={expected_dtype}, got {input.dtype}"
-    assert (
-        weight.dtype == expected_dtype
-    ), f"Cortex-M float transpose_conv2d expects weight dtype={expected_dtype}, got {weight.dtype}"
-    assert input.dim() == 4 and weight.dim() == 4, (
-        "Cortex-M float transpose_conv2d expects 4D input and weight tensors, "
-        f"got input.dim()={input.dim()}, weight.dim()={weight.dim()}"
+    stride_vals = list(stride)
+    padding_vals = list(padding)
+    dilation_vals = list(dilation)
+    output_shape = _compute_conv2d_output_shape(
+        input.shape, weight.shape, stride_vals, padding_vals, dilation_vals
     )
-    assert is_channels_last(
-        input
-    ), "Cortex-M float transpose_conv2d expects channels-last input"
-    if bias is not None:
-        assert (
-            bias.dtype == expected_dtype
-        ), f"Cortex-M float transpose_conv2d expects bias dtype={expected_dtype}, got {bias.dtype}"
-        assert bias.dim() == 1 and bias.shape[0] == weight.shape[0], (
-            "Cortex-M float transpose_conv2d expects bias shape [out_channels], "
-            f"got bias.shape={tuple(bias.shape)}, out_channels={weight.shape[0]}"
-        )
-
-    output_shape = _compute_conv_transpose2d_output_shape(
-        input.shape,
-        weight.shape,
-        list(stride),
-        list(padding),
-        list(output_padding),
-        list(dilation),
-    )
-
     return torch.empty(
         output_shape,
-        dtype=expected_dtype,
+        dtype=torch.int8,
         device=input.device,
         memory_format=torch.channels_last,
     )
 
 
-def _transpose_conv2d_float_impl(
+@impl(lib, "quantized_conv2d", "CompositeExplicitAutograd")  # type: ignore[misc]
+def quantized_conv2d_impl(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     stride: Sequence[int],
     padding: Sequence[int],
-    output_padding: Sequence[int],
     dilation: Sequence[int],
-    activation_min: float,
-    activation_max: float,
-    expected_dtype: torch.dtype,
+    input_offset: int,
+    output_offset: int,
+    requantize_multipliers: torch.Tensor,
+    requantize_shifts: torch.Tensor,
+    activation_min: int,
+    activation_max: int,
+    scratch: torch.Tensor,
 ) -> torch.Tensor:
-    _transpose_conv2d_float_meta_impl(
-        input,
-        weight,
-        bias,
-        stride,
-        padding,
-        output_padding,
-        dilation,
-        expected_dtype,
+    if input.dim() != 4 or weight.dim() != 4:
+        raise RuntimeError("quantized_conv2d expects 4D input and weight tensors")
+    # Convert to int32 for accumulation and apply offsets
+    input_int32 = input.to(torch.int32) + int(input_offset)
+    weight_int32 = weight.to(torch.int32)
+
+    if bias is None:
+        bias_int32 = torch.zeros(
+            weight.shape[0], dtype=torch.int32, device=input.device
+        )
+    else:
+        bias_int32 = bias.to(torch.int32)
+
+    input_channels = input.shape[1]
+    kernel_input_channels = weight.shape[3]
+    groups = input_channels // kernel_input_channels
+
+    # Convert weights back to OIHW layout expected by torch.nn.functional.conv2d
+    weight_oi_hw = weight_int32.permute(0, 3, 1, 2).contiguous()
+
+    conv_acc = F.conv2d(
+        input_int32,
+        weight_oi_hw,
+        bias_int32,
+        stride=tuple(stride),
+        padding=tuple(padding),
+        dilation=tuple(dilation),
+        groups=groups,
     )
 
-    weight_iohw = weight.permute(3, 0, 1, 2).contiguous()
-    result = F.conv_transpose2d(
-        input,
-        weight_iohw,
-        bias,
-        stride=_ensure_tuple2(stride),
-        padding=_ensure_tuple2(padding),
-        output_padding=_ensure_tuple2(output_padding),
-        dilation=_ensure_tuple2(dilation),
-        groups=1,
-    )
-    result = torch.clamp(result, min=activation_min, max=activation_max)
-    return result.contiguous(memory_format=torch.channels_last)
+    result_channels = []
+    for output_channel_i in range(conv_acc.shape[1]):
+        result_channel = requantize_cmsis(
+            conv_acc[:, output_channel_i, :, :],
+            int(requantize_multipliers[output_channel_i]),
+            int(requantize_shifts[output_channel_i]),
+        )
+        result_channels.append(result_channel)
+
+    result = torch.stack(result_channels, dim=1)
+
+    result += output_offset
+    result = torch.clamp(result, activation_min, activation_max)
+
+    # TODO - this enforces all convolution layers to result in channels last.
+    # This issue does comes min/mul layers from decomposition of hard swish
+    return result.to(torch.int8, memory_format=torch.channels_last)
 
 
-@_register_fake_if_enabled("cortex_m::transpose_conv2d_f32", torch.float32)
-def transpose_conv2d_f32_meta(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    stride: Sequence[int],
-    padding: Sequence[int],
-    output_padding: Sequence[int],
-    dilation: Sequence[int],
-    activation_min: float,
-    activation_max: float,
-) -> torch.Tensor:
-    del activation_min, activation_max
-    return _transpose_conv2d_float_meta_impl(
-        input,
-        weight,
-        bias,
-        stride,
-        padding,
-        output_padding,
-        dilation,
-        torch.float32,
-    )
-
-
-@_impl_if_enabled(
-    lib, "transpose_conv2d_f32", "CompositeExplicitAutograd", torch.float32
+lib.define(
+    "quantized_conv2d_nhwc("
+    "Tensor input, Tensor weight, Tensor? bias, int[] stride, int[] padding, "
+    "int[] dilation, int input_offset, int output_offset, "
+    "Tensor requantize_multipliers, Tensor requantize_shifts, "
+    "int activation_min, int activation_max, Tensor scratch) -> Tensor"
 )
-def transpose_conv2d_f32_impl(
+lib.define(
+    "quantized_conv2d_nhwc.out("
+    "Tensor input, Tensor weight, Tensor? bias, int[] stride, int[] padding, "
+    "int[] dilation, int input_offset, int output_offset, "
+    "Tensor requantize_multipliers, Tensor requantize_shifts, "
+    "int activation_min, int activation_max, Tensor scratch, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+
+
+@register_fake("cortex_m::quantized_conv2d_nhwc")  # type: ignore[misc]
+@experimental(_EXPLICIT_LAYOUT_EXPERIMENTAL)  # type: ignore[misc]
+def quantized_conv2d_nhwc_meta(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     stride: Sequence[int],
     padding: Sequence[int],
-    output_padding: Sequence[int],
     dilation: Sequence[int],
-    activation_min: float,
-    activation_max: float,
+    input_offset: int,
+    output_offset: int,
+    requantize_multipliers: torch.Tensor,
+    requantize_shifts: torch.Tensor,
+    activation_min: int,
+    activation_max: int,
+    scratch: torch.Tensor,
 ) -> torch.Tensor:
-    return _transpose_conv2d_float_impl(
-        input,
+    nchw = quantized_conv2d_meta(
+        input.permute(0, 3, 1, 2),
         weight,
         bias,
         stride,
         padding,
-        output_padding,
         dilation,
+        input_offset,
+        output_offset,
+        requantize_multipliers,
+        requantize_shifts,
         activation_min,
         activation_max,
-        torch.float32,
+        scratch,
     )
+    return nchw.permute(0, 2, 3, 1).contiguous()
 
 
-@_register_fake_if_enabled("cortex_m::transpose_conv2d_f16", torch.float16)
-def transpose_conv2d_f16_meta(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    stride: Sequence[int],
-    padding: Sequence[int],
-    output_padding: Sequence[int],
-    dilation: Sequence[int],
-    activation_min: float,
-    activation_max: float,
-) -> torch.Tensor:
-    del activation_min, activation_max
-    return _transpose_conv2d_float_meta_impl(
-        input,
-        weight,
-        bias,
-        stride,
-        padding,
-        output_padding,
-        dilation,
-        torch.float16,
-    )
-
-
-@_impl_if_enabled(
-    lib, "transpose_conv2d_f16", "CompositeExplicitAutograd", torch.float16
-)
-def transpose_conv2d_f16_impl(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    stride: Sequence[int],
-    padding: Sequence[int],
-    output_padding: Sequence[int],
-    dilation: Sequence[int],
-    activation_min: float,
-    activation_max: float,
-) -> torch.Tensor:
-    return _transpose_conv2d_float_impl(
-        input,
-        weight,
-        bias,
-        stride,
-        padding,
-        output_padding,
-        dilation,
-        activation_min,
-        activation_max,
-        torch.float16,
-    )
-
-
-# ===================================================================
-# QUANTIZED AVG_POOL2D OPERATION DEFINITION
-# ===================================================================
-
-lib.define(
-    "avg_pool2d_f32("
-    "Tensor input, "
-    "int[] kernel_size, "
-    "int[] stride, "
-    "int[] padding"
-    ") -> Tensor"
-)
-lib.define(
-    "avg_pool2d_f32.out("
-    "Tensor input, "
-    "int[] kernel_size, "
-    "int[] stride, "
-    "int[] padding, "
-    "*, Tensor(a!) out) -> Tensor(a!)"
-)
-
-
-@_register_fake_if_enabled("cortex_m::avg_pool2d_f32", torch.float32)
-def avg_pool2d_f32_meta(
-    input: torch.Tensor,
-    kernel_size: Sequence[int],
-    stride: Sequence[int],
-    padding: Sequence[int],
-) -> torch.Tensor:
-    assert (
-        input.dtype == torch.float32
-    ), f"Cortex-M avg_pool2d_f32 expects float32 inputs, got {input.dtype}"
-    output = F.avg_pool2d(
-        input,
-        _ensure_tuple2(kernel_size),
-        stride=_ensure_tuple2(stride),
-        padding=_ensure_tuple2(padding),
-        ceil_mode=False,
-        count_include_pad=False,
-    )
-    return torch.empty_like(output)
-
-
-@_impl_if_enabled(lib, "avg_pool2d_f32", "CompositeExplicitAutograd", torch.float32)
-def avg_pool2d_f32_impl(
-    input: torch.Tensor,
-    kernel_size: Sequence[int],
-    stride: Sequence[int],
-    padding: Sequence[int],
-) -> torch.Tensor:
-    assert (
-        input.dtype == torch.float32
-    ), f"Cortex-M avg_pool2d_f32 expects float32 inputs, got {input.dtype}"
-    return F.avg_pool2d(
-        input,
-        _ensure_tuple2(kernel_size),
-        stride=_ensure_tuple2(stride),
-        padding=_ensure_tuple2(padding),
-        ceil_mode=False,
-        count_include_pad=False,
-    )
-
-
-lib.define(
-    "avg_pool2d_f16("
-    "Tensor input, "
-    "int[] kernel_size, "
-    "int[] stride, "
-    "int[] padding"
-    ") -> Tensor"
-)
-lib.define(
-    "avg_pool2d_f16.out("
-    "Tensor input, "
-    "int[] kernel_size, "
-    "int[] stride, "
-    "int[] padding, "
-    "*, Tensor(a!) out) -> Tensor(a!)"
-)
-
-
-@_register_fake_if_enabled("cortex_m::avg_pool2d_f16", torch.float16)
-def avg_pool2d_f16_meta(
-    input: torch.Tensor,
-    kernel_size: Sequence[int],
-    stride: Sequence[int],
-    padding: Sequence[int],
-) -> torch.Tensor:
-    assert (
-        input.dtype == torch.float16
-    ), f"Cortex-M avg_pool2d_f16 expects float16 inputs, got {input.dtype}"
-    output = F.avg_pool2d(
-        input,
-        _ensure_tuple2(kernel_size),
-        stride=_ensure_tuple2(stride),
-        padding=_ensure_tuple2(padding),
-        ceil_mode=False,
-        count_include_pad=False,
-    )
-    return torch.empty_like(output)
-
-
-@_impl_if_enabled(lib, "avg_pool2d_f16", "CompositeExplicitAutograd", torch.float16)
-def avg_pool2d_f16_impl(
-    input: torch.Tensor,
-    kernel_size: Sequence[int],
-    stride: Sequence[int],
-    padding: Sequence[int],
-) -> torch.Tensor:
-    assert (
-        input.dtype == torch.float16
-    ), f"Cortex-M avg_pool2d_f16 expects float16 inputs, got {input.dtype}"
-    return F.avg_pool2d(
-        input,
-        _ensure_tuple2(kernel_size),
-        stride=_ensure_tuple2(stride),
-        padding=_ensure_tuple2(padding),
-        ceil_mode=False,
-        count_include_pad=False,
-    )
-
-
-lib.define(
-    "max_pool2d_f32("
-    "Tensor input, "
-    "int[] kernel_size, "
-    "int[] stride, "
-    "int[] padding"
-    ") -> Tensor"
-)
-
-lib.define(
-    "max_pool2d_f32.out("
-    "Tensor input, "
-    "int[] kernel_size, "
-    "int[] stride, "
-    "int[] padding, "
-    "*, Tensor(a!) out"
-    ") -> Tensor(a!)"
-)
-
-
-@_register_fake_if_enabled("cortex_m::max_pool2d_f32", torch.float32)
-def max_pool2d_f32_meta(
-    input: torch.Tensor,
-    kernel_size: Sequence[int],
-    stride: Sequence[int],
-    padding: Sequence[int],
-) -> torch.Tensor:
-    if input.dtype != torch.float32:
-        raise RuntimeError(
-            f"Cortex-M max_pool2d_f32 expects float32 inputs, got {input.dtype}"
-        )
-
-    kernel = _ensure_tuple2(kernel_size)
-    stride_vals = _ensure_tuple2(stride)
-    padding_vals = _ensure_tuple2(padding)
-    output_shape = _compute_max_pool2d_output_shape(
-        input.shape, kernel, stride_vals, padding_vals, (1, 1)
-    )
-    return torch.empty(
-        output_shape,
-        dtype=torch.float32,
-        device=input.device,
-        memory_format=torch.channels_last,
-    )
-
-
-@_impl_if_enabled(lib, "max_pool2d_f32", "CompositeExplicitAutograd", torch.float32)
-def max_pool2d_f32_impl(
-    input: torch.Tensor,
-    kernel_size: Sequence[int],
-    stride: Sequence[int],
-    padding: Sequence[int],
-) -> torch.Tensor:
-    if input.dtype != torch.float32:
-        raise RuntimeError(
-            f"Cortex-M max_pool2d_f32 expects float32 inputs, got {input.dtype}"
-        )
-
-    kernel = _ensure_tuple2(kernel_size)
-    stride_vals = _ensure_tuple2(stride)
-    padding_vals = _ensure_tuple2(padding)
-    return F.max_pool2d(
-        input,
-        kernel,
-        stride=stride_vals,
-        padding=padding_vals,
-        dilation=(1, 1),
-        ceil_mode=False,
-    ).contiguous(memory_format=torch.channels_last)
-
-
-lib.define(
-    "max_pool2d_f16("
-    "Tensor input, "
-    "int[] kernel_size, "
-    "int[] stride, "
-    "int[] padding"
-    ") -> Tensor"
-)
-
-lib.define(
-    "max_pool2d_f16.out("
-    "Tensor input, "
-    "int[] kernel_size, "
-    "int[] stride, "
-    "int[] padding, "
-    "*, Tensor(a!) out"
-    ") -> Tensor(a!)"
-)
-
-
-@_register_fake_if_enabled("cortex_m::max_pool2d_f16", torch.float16)
-def max_pool2d_f16_meta(
-    input: torch.Tensor,
-    kernel_size: Sequence[int],
-    stride: Sequence[int],
-    padding: Sequence[int],
-) -> torch.Tensor:
-    if input.dtype != torch.float16:
-        raise RuntimeError(
-            f"Cortex-M max_pool2d_f16 expects float16 inputs, got {input.dtype}"
-        )
-
-    kernel = _ensure_tuple2(kernel_size)
-    stride_vals = _ensure_tuple2(stride)
-    padding_vals = _ensure_tuple2(padding)
-    output_shape = _compute_max_pool2d_output_shape(
-        input.shape, kernel, stride_vals, padding_vals, (1, 1)
-    )
-    return torch.empty(
-        output_shape,
-        dtype=torch.float16,
-        device=input.device,
-        memory_format=torch.channels_last,
-    )
-
-
-@_impl_if_enabled(lib, "max_pool2d_f16", "CompositeExplicitAutograd", torch.float16)
-def max_pool2d_f16_impl(
-    input: torch.Tensor,
-    kernel_size: Sequence[int],
-    stride: Sequence[int],
-    padding: Sequence[int],
-) -> torch.Tensor:
-    if input.dtype != torch.float16:
-        raise RuntimeError(
-            f"Cortex-M max_pool2d_f16 expects float16 inputs, got {input.dtype}"
-        )
-
-    kernel = _ensure_tuple2(kernel_size)
-    stride_vals = _ensure_tuple2(stride)
-    padding_vals = _ensure_tuple2(padding)
-    return F.max_pool2d(
-        input,
-        kernel,
-        stride=stride_vals,
-        padding=padding_vals,
-        dilation=(1, 1),
-        ceil_mode=False,
-    ).contiguous(memory_format=torch.channels_last)
-
-
-@register_fake("cortex_m::quantized_max_pool2d")  # type: ignore[misc]
 @impl(lib, "quantized_conv2d_nhwc", "CompositeExplicitAutograd")  # type: ignore[misc]
 def quantized_conv2d_nhwc_impl(
     input: torch.Tensor,
@@ -4151,8 +3596,6 @@ def quantized_transpose_conv2d_impl(
     requantize_shifts: torch.Tensor,
     activation_min: int,
     activation_max: int,
-    scratch: torch.Tensor,
-    output_scratch: torch.Tensor,
 ) -> torch.Tensor:
     """
     Reference implementation of quantized transposed convolution.
@@ -4211,6 +3654,256 @@ def quantized_transpose_conv2d_impl(
     result = result.clamp(activation_min, activation_max)
 
     return result.to(torch.int8).to(memory_format=torch.channels_last)
+
+
+lib.define(
+    "transpose_conv2d_f32("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] output_padding, "
+    "int[] dilation, "
+    "float activation_min, "
+    "float activation_max"
+    ") -> Tensor"
+)
+
+lib.define(
+    "transpose_conv2d_f32.out("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] output_padding, "
+    "int[] dilation, "
+    "float activation_min, "
+    "float activation_max, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+
+lib.define(
+    "transpose_conv2d_f16("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] output_padding, "
+    "int[] dilation, "
+    "float activation_min, "
+    "float activation_max"
+    ") -> Tensor"
+)
+
+lib.define(
+    "transpose_conv2d_f16.out("
+    "Tensor input, "
+    "Tensor weight, "
+    "Tensor? bias, "
+    "int[] stride, "
+    "int[] padding, "
+    "int[] output_padding, "
+    "int[] dilation, "
+    "float activation_min, "
+    "float activation_max, "
+    "*, Tensor(a!) out) -> Tensor(a!)"
+)
+
+
+def _transpose_conv2d_float_meta_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    assert (
+        input.dtype == expected_dtype
+    ), f"Cortex-M float transpose_conv2d expects input dtype={expected_dtype}, got {input.dtype}"
+    assert (
+        weight.dtype == expected_dtype
+    ), f"Cortex-M float transpose_conv2d expects weight dtype={expected_dtype}, got {weight.dtype}"
+    assert input.dim() == 4 and weight.dim() == 4, (
+        "Cortex-M float transpose_conv2d expects 4D input and weight tensors, "
+        f"got input.dim()={input.dim()}, weight.dim()={weight.dim()}"
+    )
+    assert is_channels_last(
+        input
+    ), "Cortex-M float transpose_conv2d expects channels-last input"
+    if bias is not None:
+        assert (
+            bias.dtype == expected_dtype
+        ), f"Cortex-M float transpose_conv2d expects bias dtype={expected_dtype}, got {bias.dtype}"
+        assert bias.dim() == 1 and bias.shape[0] == weight.shape[0], (
+            "Cortex-M float transpose_conv2d expects bias shape [out_channels], "
+            f"got bias.shape={tuple(bias.shape)}, out_channels={weight.shape[0]}"
+        )
+
+    output_shape = _compute_conv_transpose2d_output_shape(
+        input.shape,
+        weight.shape,
+        list(stride),
+        list(padding),
+        list(output_padding),
+        list(dilation),
+    )
+
+    return torch.empty(
+        output_shape,
+        dtype=expected_dtype,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+def _transpose_conv2d_float_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    activation_min: float,
+    activation_max: float,
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    _transpose_conv2d_float_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        expected_dtype,
+    )
+
+    weight_iohw = weight.permute(3, 0, 1, 2).contiguous()
+    result = F.conv_transpose2d(
+        input,
+        weight_iohw,
+        bias,
+        stride=_ensure_tuple2(stride),
+        padding=_ensure_tuple2(padding),
+        output_padding=_ensure_tuple2(output_padding),
+        dilation=_ensure_tuple2(dilation),
+        groups=1,
+    )
+    result = torch.clamp(result, min=activation_min, max=activation_max)
+    return result.contiguous(memory_format=torch.channels_last)
+
+
+@_register_fake_if_enabled("cortex_m::transpose_conv2d_f32", torch.float32)
+def transpose_conv2d_f32_meta(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del activation_min, activation_max
+    return _transpose_conv2d_float_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        torch.float32,
+    )
+
+
+@_impl_if_enabled(
+    lib, "transpose_conv2d_f32", "CompositeExplicitAutograd", torch.float32
+)
+def transpose_conv2d_f32_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _transpose_conv2d_float_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        activation_min,
+        activation_max,
+        torch.float32,
+    )
+
+
+@_register_fake_if_enabled("cortex_m::transpose_conv2d_f16", torch.float16)
+def transpose_conv2d_f16_meta(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    del activation_min, activation_max
+    return _transpose_conv2d_float_meta_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        torch.float16,
+    )
+
+
+@_impl_if_enabled(
+    lib, "transpose_conv2d_f16", "CompositeExplicitAutograd", torch.float16
+)
+def transpose_conv2d_f16_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    output_padding: Sequence[int],
+    dilation: Sequence[int],
+    activation_min: float,
+    activation_max: float,
+) -> torch.Tensor:
+    return _transpose_conv2d_float_impl(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        activation_min,
+        activation_max,
+        torch.float16,
+    )
 
 
 lib.define(
@@ -4309,8 +4002,70 @@ def quantized_transpose_conv2d_nhwc_impl(
 
 
 # ===================================================================
-# QUANTIZED AVG_POOL2D OPERATION DEFINITION
+# FLOAT / QUANTIZED AVG_POOL2D OPERATION DEFINITION
 # ===================================================================
+
+lib.define(
+    "avg_pool2d_f32(Tensor input, int[] kernel_size, int[] stride, "
+    "int[] padding) -> Tensor"
+)
+lib.define(
+    "avg_pool2d_f32.out(Tensor input, int[] kernel_size, int[] stride, "
+    "int[] padding, *, Tensor(a!) out) -> Tensor(a!)"
+)
+lib.define(
+    "avg_pool2d_f16(Tensor input, int[] kernel_size, int[] stride, "
+    "int[] padding) -> Tensor"
+)
+lib.define(
+    "avg_pool2d_f16.out(Tensor input, int[] kernel_size, int[] stride, "
+    "int[] padding, *, Tensor(a!) out) -> Tensor(a!)"
+)
+
+
+def _avg_pool2d_float(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    return F.avg_pool2d(
+        input,
+        _ensure_tuple2(kernel_size),
+        stride=_ensure_tuple2(stride),
+        padding=_ensure_tuple2(padding),
+        ceil_mode=False,
+        count_include_pad=False,
+    )
+
+
+@_register_fake_if_enabled("cortex_m::avg_pool2d_f32", torch.float32)
+def avg_pool2d_f32_meta(input, kernel_size, stride, padding):
+    if input.dtype != torch.float32:
+        raise TypeError(f"avg_pool2d_f32 expected float32, got {input.dtype}")
+    return torch.empty_like(_avg_pool2d_float(input, kernel_size, stride, padding))
+
+
+@_impl_if_enabled(lib, "avg_pool2d_f32", "CompositeExplicitAutograd", torch.float32)
+def avg_pool2d_f32_impl(input, kernel_size, stride, padding):
+    if input.dtype != torch.float32:
+        raise TypeError(f"avg_pool2d_f32 expected float32, got {input.dtype}")
+    return _avg_pool2d_float(input, kernel_size, stride, padding)
+
+
+@_register_fake_if_enabled("cortex_m::avg_pool2d_f16", torch.float16)
+def avg_pool2d_f16_meta(input, kernel_size, stride, padding):
+    if input.dtype != torch.float16:
+        raise TypeError(f"avg_pool2d_f16 expected float16, got {input.dtype}")
+    return torch.empty_like(_avg_pool2d_float(input, kernel_size, stride, padding))
+
+
+@_impl_if_enabled(lib, "avg_pool2d_f16", "CompositeExplicitAutograd", torch.float16)
+def avg_pool2d_f16_impl(input, kernel_size, stride, padding):
+    if input.dtype != torch.float16:
+        raise TypeError(f"avg_pool2d_f16 expected float16, got {input.dtype}")
+    return _avg_pool2d_float(input, kernel_size, stride, padding)
+
 
 lib.define(
     "quantized_avg_pool2d("
@@ -4538,6 +4293,148 @@ def _compute_max_pool2d_output_shape(
         in_width + 2 * pad_w - dilation_w * (kernel_width - 1) - 1
     ) // stride_w + 1
     return torch.Size([batch, channels, out_height, out_width])
+
+
+lib.define(
+    "max_pool2d_f32("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding"
+    ") -> Tensor"
+)
+
+lib.define(
+    "max_pool2d_f32.out("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@_register_fake_if_enabled("cortex_m::max_pool2d_f32", torch.float32)
+def max_pool2d_f32_meta(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    if input.dtype != torch.float32:
+        raise RuntimeError(
+            f"Cortex-M max_pool2d_f32 expects float32 inputs, got {input.dtype}"
+        )
+
+    kernel = _ensure_tuple2(kernel_size)
+    stride_vals = _ensure_tuple2(stride)
+    padding_vals = _ensure_tuple2(padding)
+    output_shape = _compute_max_pool2d_output_shape(
+        input.shape, kernel, stride_vals, padding_vals, (1, 1)
+    )
+    return torch.empty(
+        output_shape,
+        dtype=torch.float32,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+@_impl_if_enabled(lib, "max_pool2d_f32", "CompositeExplicitAutograd", torch.float32)
+def max_pool2d_f32_impl(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    if input.dtype != torch.float32:
+        raise RuntimeError(
+            f"Cortex-M max_pool2d_f32 expects float32 inputs, got {input.dtype}"
+        )
+
+    kernel = _ensure_tuple2(kernel_size)
+    stride_vals = _ensure_tuple2(stride)
+    padding_vals = _ensure_tuple2(padding)
+    return F.max_pool2d(
+        input,
+        kernel,
+        stride=stride_vals,
+        padding=padding_vals,
+        dilation=(1, 1),
+        ceil_mode=False,
+    ).contiguous(memory_format=torch.channels_last)
+
+
+lib.define(
+    "max_pool2d_f16("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding"
+    ") -> Tensor"
+)
+
+lib.define(
+    "max_pool2d_f16.out("
+    "Tensor input, "
+    "int[] kernel_size, "
+    "int[] stride, "
+    "int[] padding, "
+    "*, Tensor(a!) out"
+    ") -> Tensor(a!)"
+)
+
+
+@_register_fake_if_enabled("cortex_m::max_pool2d_f16", torch.float16)
+def max_pool2d_f16_meta(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    if input.dtype != torch.float16:
+        raise RuntimeError(
+            f"Cortex-M max_pool2d_f16 expects float16 inputs, got {input.dtype}"
+        )
+
+    kernel = _ensure_tuple2(kernel_size)
+    stride_vals = _ensure_tuple2(stride)
+    padding_vals = _ensure_tuple2(padding)
+    output_shape = _compute_max_pool2d_output_shape(
+        input.shape, kernel, stride_vals, padding_vals, (1, 1)
+    )
+    return torch.empty(
+        output_shape,
+        dtype=torch.float16,
+        device=input.device,
+        memory_format=torch.channels_last,
+    )
+
+
+@_impl_if_enabled(lib, "max_pool2d_f16", "CompositeExplicitAutograd", torch.float16)
+def max_pool2d_f16_impl(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+) -> torch.Tensor:
+    if input.dtype != torch.float16:
+        raise RuntimeError(
+            f"Cortex-M max_pool2d_f16 expects float16 inputs, got {input.dtype}"
+        )
+
+    kernel = _ensure_tuple2(kernel_size)
+    stride_vals = _ensure_tuple2(stride)
+    padding_vals = _ensure_tuple2(padding)
+    return F.max_pool2d(
+        input,
+        kernel,
+        stride=stride_vals,
+        padding=padding_vals,
+        dilation=(1, 1),
+        ceil_mode=False,
+    ).contiguous(memory_format=torch.channels_last)
 
 
 @register_fake("cortex_m::quantized_max_pool2d")  # type: ignore[misc]

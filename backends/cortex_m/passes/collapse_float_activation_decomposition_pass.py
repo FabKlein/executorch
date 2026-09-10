@@ -44,7 +44,7 @@ from executorch.backends.cortex_m.passes.float_activation_pattern_utils import (
     match_clamp_chain,
     resolve_scalar_value,
 )
-from executorch.backends.cortex_m.passes.float_capabilities import (
+from executorch.backends.cortex_m.float_capabilities import (
     CortexMFloatCapabilities,
     get_cortex_m_float_capabilities,
     get_optional_cortex_m_float_op,

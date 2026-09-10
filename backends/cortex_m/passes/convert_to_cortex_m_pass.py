@@ -18,7 +18,7 @@ import executorch.backends.cortex_m.ops.operators  # noqa
 import torch
 import torch.fx
 from executorch.backends.arm._passes.arm_pass_utils import get_first_fake_tensor
-from executorch.backends.cortex_m.passes.float_capabilities import (
+from executorch.backends.cortex_m.float_capabilities import (
     CortexMFloatCapabilities,
     get_cortex_m_float_capabilities,
 )

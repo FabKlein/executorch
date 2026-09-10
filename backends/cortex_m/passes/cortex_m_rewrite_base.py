@@ -6,7 +6,7 @@
 from typing import cast, Optional
 
 import torch
-from executorch.backends.cortex_m.passes.float_capabilities import (
+from executorch.backends.cortex_m.float_capabilities import (
     CortexMFloatCapabilities,
     get_cortex_m_float_capabilities,
 )

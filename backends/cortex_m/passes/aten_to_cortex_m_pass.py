@@ -151,6 +151,11 @@ def _restore_max_pool2d_with_indices_fallback(
 
         output_value = _first_meta_value(node.meta.get("val"))
         output_tensor_meta = _first_meta_value(node.meta.get("tensor_meta"))
+        # Float max-pool nodes are lowered by FloatPoolRewritePass later in the
+        # combined pipeline. This fallback restoration is only for quantized
+        # max-pool configurations rejected by AtenToCortexMPass.
+        if getattr(output_value, "dtype", None) in (torch.float16, torch.float32):
+            continue
 
         with graph_module.graph.inserting_before(node):
             max_pool_with_indices = graph_module.graph.create_node(

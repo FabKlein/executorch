@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import torch
-from executorch.backends.cortex_m.passes.float_capabilities import (
+from executorch.backends.cortex_m.float_capabilities import (
     get_optional_cortex_m_float_op,
 )
 from executorch.backends.transforms.utils import (
