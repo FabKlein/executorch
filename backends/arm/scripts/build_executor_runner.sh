@@ -34,6 +34,8 @@ et_build_root="${et_root_dir}/arm_test"
 ethosu_tools_dir=${et_root_dir}/examples/arm/arm-scratch
 select_ops_list=""
 cmsis_nn_local_path=""
+cmsis_nn_enable_f32=OFF
+cmsis_nn_enable_f16=OFF
 
 build_bundleio_flags=" -DET_BUNDLE_IO=OFF "
 build_with_etdump_flags=" -DEXECUTORCH_ENABLE_EVENT_TRACER=OFF "
@@ -71,6 +73,8 @@ help() {
     echo "  --ethosu_tools_dir=<FOLDER>          Path to your Ethos-U tools dir if you not using default: ${ethosu_tools_dir}"
     echo "  --toolchain=<TOOLCHAIN>              Toolchain can be specified (arm-none-eabi-gcc, armclang, clang, arm-zephyr-eabi-gcc). Default: ${toolchain}"
     echo "  --cmsis_nn_local_path=<PATH>         Use a local CMSIS-NN checkout instead of the arm-scratch copy."
+    echo "  --cmsis_nn_enable_f32                Enable CMSIS-NN float32 support."
+    echo "  --cmsis_nn_enable_f16                Enable CMSIS-NN float16 support."
     echo "  --select_ops_list=<OPS>              Comma separated list of portable (non-delegated) kernels to include Default: ${select_ops_list}"
     echo "                                         NOTE: This is used when select_ops_model is not possible to use, e.g. for semihosting or bundleio."
     echo "                                         See https://docs.pytorch.org/executorch/stable/kernel-library-selective-build.html for more information."
@@ -93,6 +97,8 @@ for arg in "$@"; do
         --ethosu_tools_dir=*) ethosu_tools_dir="${arg#*=}";;
         --toolchain=*) toolchain="${arg#*=}";;
         --cmsis_nn_local_path=*) cmsis_nn_local_path="${arg#*=}";;
+        --cmsis_nn_enable_f32) cmsis_nn_enable_f32=ON ;;
+        --cmsis_nn_enable_f16) cmsis_nn_enable_f16=ON ;;
         --select_ops_list=*) select_ops_list="${arg#*=}";;
         *)
         ;;
@@ -261,6 +267,8 @@ cmake \
     -DETHOSU_TARGET_NPU_CONFIG=${npu_target_config} \
     -DEXECUTORCH_BUILD_PRESET_FILE=${preset_file} \
     -DEXECUTORCH_BAREMETAL_SKIP_INSTALL=OFF    \
+    -DEXECUTORCH_PAL_DEFAULT=minimal            \
+    -DEXECUTORCH_PAL_DEFAULT_FILE_PATH=${et_root_dir}/runtime/platform/default/minimal.cpp \
     ${pte_data}                                \
     ${build_bundleio_flags}                    \
     ${build_with_etdump_flags}                 \
@@ -271,6 +279,8 @@ cmake \
     -DEXECUTORCH_SELECT_OPS_LIST="${select_ops_list}" \
     -DETHOS_SDK_PATH:PATH=${ethos_u_root_dir}  \
     ${cmsis_nn_local_path:+-DCMSIS_NN_LOCAL_PATH:PATH=${cmsis_nn_local_path}} \
+    -DARM_NN_ENABLE_F32=${cmsis_nn_enable_f32} \
+    -DARM_NN_ENABLE_F16=${cmsis_nn_enable_f16} \
     ${extra_build_flags}
 
 echo "[${BASH_SOURCE[0]}] Configured CMAKE"

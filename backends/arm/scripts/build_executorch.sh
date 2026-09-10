@@ -179,6 +179,13 @@ parallel_jobs="$(get_parallel_jobs)"
 
 if [[ ${is_linux_musl} -eq 1 ]]; then
     cmake --build ${et_build_dir} -j"${parallel_jobs}" --target executorch_delegate_ethos_u executor_runner --config ${build_type} --
+elif [[ ( ${toolchain} == "armclang" || ${toolchain} == "clang" ) && ${build_devtools} == "OFF" && ${build_with_etdump} == "OFF" ]]; then
+    # Avoid cross-compiling host-only utilities such as gflags with a bare-metal
+    # C library. These are the libraries consumed by Cortex-M applications.
+    cmake --build ${et_build_dir} -j"${parallel_jobs}" \
+        --target executorch extension_runner_util portable_ops_lib \
+        quantized_ops_lib cortex_m_ops_lib executorch_delegate_ethos_u \
+        --config ${build_type}
 else
     cmake --build ${et_build_dir} -j"${parallel_jobs}" --config ${build_type}
 fi

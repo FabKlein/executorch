@@ -10,13 +10,20 @@ from typing import Any, Callable, TypeGuard
 
 import torch
 
+from executorch.backends.cortex_m.ops.operator_utils import (
+    dequantize_per_tensor_cmsis,
+    is_channel_broadcast,
+    is_channels_last,
+    is_default_dim_order,
+    is_default_or_channels_last,
+    quantize_per_tensor_cmsis,
+    requantize_cmsis,
+    SHIFT_INT8,
+)
 from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.dialects.edge._ops import EdgeOpOverload
 
 from torch.fx import Node
-
-# L-shift value used in CMSIS-NN for int8 operations
-SHIFT_INT8 = 20
 
 
 def quantize_val(val, scale, zp, qmin, qmax):
@@ -71,67 +78,6 @@ def get_activation_bounds(node: Node) -> tuple[float | None, float | None] | Non
         return None
 
     return bounds
-
-
-def dequantize_per_tensor_cmsis(
-    qtensor: torch.Tensor, zero_point: int, multiplier: int, shift: int
-) -> torch.Tensor:
-    """
-    Simulate CMSIS-NN fixed-point dequantization:
-    result = (qtensor - zero_point) * multiplier * 2^shift / 2^31
-    """
-    scale = multiplier * (2**shift) / (1 << 31)
-    return (qtensor.float() - zero_point) * scale
-
-
-def quantize_per_tensor_cmsis(
-    tensor: torch.Tensor,
-    zero_point: int,
-    multiplier: int,
-    shift: int,
-    qmin=-128,
-    qmax=127,
-) -> torch.Tensor:
-    """
-    Simulate CMSIS-NN fixed-point quantization:
-    result = round(tensor / scale) + zero_point, clamped to [qmin, qmax]
-    """
-    scale = multiplier * (2**shift) / (1 << 31)
-    quantized = torch.round(tensor / scale) + zero_point
-    return quantized.clamp(qmin, qmax).to(torch.int8)
-
-
-def requantize_cmsis(
-    tensor: torch.Tensor,
-    multiplier: int,
-    shift: int,
-) -> torch.Tensor:
-    """Simulate CMSIS-NN's arm_nn_requantize helper."""
-
-    tensor_64 = tensor.to(torch.int64)
-    left_shift = max(shift, 0)
-    right_shift = max(-shift, 0)
-
-    # Equivalent to val * (1 << LEFT_SHIFT(shift))
-    value = tensor_64 << left_shift
-
-    # arm_nn_doubling_high_mult_no_sat(value, multiplier)
-    product = value * int(multiplier)
-    product = product + (1 << 30)
-    result = product >> 31
-
-    if right_shift:
-        remainder_mask = (1 << right_shift) - 1
-        remainder = torch.bitwise_and(result, remainder_mask)
-        result = result >> right_shift
-        threshold = remainder_mask >> 1
-        threshold_tensor = torch.full_like(result, threshold, dtype=torch.int64)
-        threshold_tensor = torch.where(
-            result < 0, threshold_tensor + 1, threshold_tensor
-        )
-        result = result + torch.where(remainder > threshold_tensor, 1, 0)
-
-    return result.to(torch.int32)
 
 
 def extract_scalar_value(node_arg) -> float:
@@ -386,18 +332,6 @@ def cleanup_nodes(nodes_to_erase, graph):
     return failed_nodes
 
 
-def is_channels_last(tensor: torch.Tensor) -> bool:
-    """Check if a 4D tensor is in channels last format."""
-    if tensor.ndim != 4:
-        return False
-
-    if tensor.shape[1] == 1 or tensor.shape[2] == tensor.shape[3] == 1:
-        return True
-
-    dim_order = list(tensor.dim_order())
-    return dim_order[0:2] == [0, 2]
-
-
 _NHWC_DIM_ORDER = [0, 2, 3, 1]
 
 
@@ -407,38 +341,6 @@ def to_physical_order(logical_pad: list[int], tensor: torch.Tensor) -> list[int]
     if not is_channels_last(tensor):
         return logical_pad
     return [logical_pad[_NHWC_DIM_ORDER[i]] for i in range(4)]
-
-
-def is_default_dim_order(tensor: torch.Tensor) -> bool:
-    """Check if a tensor uses the default logical dim order."""
-    dim_order = list(tensor.dim_order())
-    return dim_order == list(range(tensor.ndim))
-
-
-def is_default_or_channels_last(tensor: torch.Tensor) -> bool:
-    """Check if a 4D tensor uses one of the layout forms the backend understands."""
-    if tensor.ndim != 4:
-        return False
-    return is_default_dim_order(tensor) or is_channels_last(tensor)
-
-
-def is_channel_broadcast(tensor1: torch.Tensor, tensor2: torch.Tensor) -> bool:
-    """
-    Check if tensor1 is broadcasted to tensor2 along channel dimension.
-    Assumes tensor2 has shape [N, C, ...] and tensor1 has shape [N, 1, ...] or [1, C, ...].
-    """
-    if tensor1.dim() != tensor2.dim():
-        return False
-    if not is_channels_last(tensor1):
-        return False
-    if not is_channels_last(tensor2):
-        return False
-
-    channel_match = tensor1.size(1) == tensor2.size(1)
-    tensor1_channels_only = tensor1.numel() == tensor1.size(1)
-    tensor2_channels_only = tensor2.numel() == tensor2.size(1)
-
-    return channel_match and (tensor1_channels_only or tensor2_channels_only)
 
 
 def is_float_depthwise_conv(in_channels: int, out_channels: int, groups: int) -> bool:

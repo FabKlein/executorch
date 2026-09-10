@@ -25,7 +25,7 @@ from executorch.backends.cortex_m.float_activation_constants import (
 from executorch.backends.cortex_m.float_capabilities import (
     get_cortex_m_float_capabilities,
 )
-from executorch.backends.cortex_m.passes.passes_utils import (
+from executorch.backends.cortex_m.ops.operator_utils import (
     dequantize_per_tensor_cmsis,
     is_channel_broadcast,
     is_channels_last,
