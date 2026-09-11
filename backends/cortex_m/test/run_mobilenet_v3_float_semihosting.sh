@@ -133,6 +133,7 @@ export_script="backends/cortex_m/test/models/export_float_mobilenet_v3_demo.py"
 
 cd "${et_root_dir}"
 source venv/bin/activate
+caller_pythonpath="${PYTHONPATH:-}"
 if [[ -n "${toolchain_bin}" ]]; then
   export PATH="${toolchain_bin}:${PATH}"
 fi
@@ -145,7 +146,7 @@ if [[ "${toolchain}" == "armclang" ]]; then
 elif [[ "${toolchain}" == "clang" ]]; then
   export CLANG_TOOLCHAIN_ROOT="${toolchain_bin}"
 fi
-export PYTHONPATH="${et_root_dir}/src"
+export PYTHONPATH="${et_root_dir}/src${caller_pythonpath:+:${caller_pythonpath}}"
 source backends/cortex_m/test/float_backend_env.sh
 check_toolchain
 set_cortex_m_float_backend_for_dtype "${dtype}"
@@ -168,7 +169,6 @@ build_executorch_args=(
   --toolchain="${toolchain}"
   --et_build_root="${et_build_root}"
   "${CORTEX_M_FLOAT_BUILD_ARGS[@]}"
-  --devtools
 )
 if [[ -n "${cmsis_nn_local_path}" ]]; then
   build_executorch_args+=(--cmsis_nn_local_path="${cmsis_nn_local_path}")
@@ -193,7 +193,7 @@ from pathlib import Path
 import yaml
 
 data = yaml.safe_load(Path(os.environ["ET_MV3_SELECTED_OPS_YAML"]).read_text())
-ops = [op for op in data.get("operators", {}).keys() if op.startswith("aten::") or op.startswith("dim_order_ops::")]
+ops = list(data.get("operators", {}).keys())
 print(",".join(sorted(ops)))
 PY
 )"
@@ -207,6 +207,7 @@ runner_build_args=(
   --memory_mode=Shared_Sram
   --output="${runner_dir}"
   --select_ops_list="${select_ops_list}"
+  "${CORTEX_M_FLOAT_BUILD_ARGS[@]}"
   --extra_build_flags=-DET_ARM_BAREMETAL_METHOD_ALLOCATOR_POOL_SIZE=83886080
 )
 if [[ -n "${cmsis_nn_local_path}" ]]; then

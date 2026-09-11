@@ -50,6 +50,8 @@ LOAD_REGION_DDR 0x70000000 0x60000000
 {
     ddr.bin 0x70000000 ALIGN 16 0x60000000
     {
+        * (.bss.input_file_allocator_sec)
+        * (.bss.method_allocator_sec)
         * (input_data_sec)
         * (network_model_sec)
         * (expected_output_data_sec)

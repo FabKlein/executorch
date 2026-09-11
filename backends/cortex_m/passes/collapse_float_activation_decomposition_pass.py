@@ -118,10 +118,10 @@ class CollapseFloatActivationDecompositionPass(ExportPass):
         )
 
     @staticmethod
-    def _unwrap_promoted_hardswish_input(
+    def _unwrap_promoted_activation_input(
         x_node: torch.fx.Node, dtype: torch.dtype
     ) -> tuple[torch.fx.Node, torch.dtype]:
-        """Recover the original f16 tensor from export's hardswish f32 island.
+        """Recover the original f16 tensor from an exported activation's f32 island.
 
         Some TorchScript exports implement f16 hardswish by first promoting the
         activation input to f32:
@@ -171,11 +171,11 @@ class CollapseFloatActivationDecompositionPass(ExportPass):
 
         lhs_match = self._match_hardsigmoid_div(lhs)
         if lhs_match is not None and rhs is lhs_match[0]:
-            return self._unwrap_promoted_hardswish_input(*lhs_match)
+            return self._unwrap_promoted_activation_input(*lhs_match)
 
         rhs_match = self._match_hardsigmoid_div(rhs)
         if rhs_match is not None and lhs is rhs_match[0]:
-            return self._unwrap_promoted_hardswish_input(*rhs_match)
+            return self._unwrap_promoted_activation_input(*rhs_match)
 
         return None
 
@@ -212,7 +212,7 @@ class CollapseFloatActivationDecompositionPass(ExportPass):
         )
         if match is None:
             return None
-        return self._unwrap_promoted_hardswish_input(*match)
+        return self._unwrap_promoted_activation_input(*match)
 
     # ------------------------------------------------------------------
     # Graph rewrite
@@ -266,7 +266,12 @@ class CollapseFloatActivationDecompositionPass(ExportPass):
             match = self._match_hardsigmoid_div(node)
             if match is None:
                 continue
-            self._replace_node(graph, node, *match, CMSIS_FLOAT_ACT_HARDSIGMOID)
+            self._replace_node(
+                graph,
+                node,
+                *self._unwrap_promoted_activation_input(*match),
+                CMSIS_FLOAT_ACT_HARDSIGMOID,
+            )
             modified = True
 
         if modified:
